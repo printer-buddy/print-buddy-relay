@@ -3,7 +3,7 @@
 `worker.js` does two jobs on `www.printerbuddy.stream`:
 
 1. **Share relay** - `/share/user/<ID>/printer/...` is fetched through that box's tunnel, so viewers never see the box's home address.
-2. **Automatic tunnels** - `/api/tunnel` lets a box set up its own tunnel (installer: Remote access > 1) Set up automatically).
+2. **Automatic tunnels** - `/api/tunnel` lets a box set up its own tunnel (installer: turn Remote access on in Change setup).
    It creates tunnel `pb-u<ID>`, routes `https://u<ID>.printerbuddy.stream/share/...` to the box, makes the DNS record,
    and posts **"Box 1234567 set up wireless sharing!"** to Discord.
 
@@ -125,5 +125,5 @@ for the next model you can pick out exactly the photos it got wrong.
 
 ## On a box
 
-`./install.sh` > **9) Remote / share links** > **1) Set up automatically**. That's all.
+`./install.sh` > **2) Change setup** > **Remote access = on**. That's all.
 To manage any box yourself, use the Cloudflare dashboard (Zero Trust > Networks > Tunnels, and DNS).
