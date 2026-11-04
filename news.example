@@ -13,7 +13,7 @@ ONE NEWS ITEM, with every option:
     "date": "2026-10-21",
     "title": "Printer Buddy v2.0 is out 🎉",
     "body": "New dashboard you can rearrange, 20+ new panels, job queue, config editor and more. Please enjoy!",
-    "link": "https://github.com/sterling5241/printer-buddy/releases",
+    "link": "https://github.com/printer-buddy/printer-buddy/releases",
     "level": "info"
   }
 
@@ -44,7 +44,7 @@ FULL news.json EXAMPLE (two items, newest first):
       "date": "2026-10-21",
       "title": "Printer Buddy v2.0 is out 🎉",
       "body": "New dashboard you can rearrange, 20+ new panels, job queue, config editor and more. Please enjoy!",
-      "link": "https://github.com/sterling5241/printer-buddy/releases",
+      "link": "https://github.com/printer-buddy/printer-buddy/releases",
       "level": "info"
     }
   ]

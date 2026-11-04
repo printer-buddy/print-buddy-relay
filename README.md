@@ -94,7 +94,7 @@ Boxes never get GitHub access; only the Worker holds the token. Limits: 50 photo
 | Type | Name | Value |
 |---|---|---|
 | Secret | `GITHUB_TOKEN` | the token from step 2 |
-| Text | `DATA_REPO` | `sterling5241/printer-buddy-data` |
+| Text | `DATA_REPO` | `printer-buddy/printer-buddy-data` |
 | optional (Text) | `CONTRIB_PER_BOX_PER_DAY` | default `50` |
 | optional (Text) | `CONTRIB_PER_IP_PER_DAY` | default `200` |
 
