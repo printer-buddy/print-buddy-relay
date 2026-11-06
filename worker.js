@@ -1,6 +1,6 @@
 import NEWS from "./news.json";
 
-const SHARE = /^\/share\/user\/(\d{6,10})\/(printer\/\d{1,9}\/[A-Za-z0-9_-]{20,100}(?:\/(?:status|snapshot|stream))?)\/?$/;
+const SHARE = /^\/share\/user\/(\d{6,10})\/(printer\/\d{1,9}\/[A-Za-z0-9_-]{20,100}(?:\/(?:status|snapshot|stream|chat))?)\/?$/;
 
 const page = (title, text, status) => new Response(
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -29,12 +29,19 @@ export default {
       if (url.pathname === "/") return page("Printer Buddy", "Self-hosted 3D printer monitoring. Open a share link to watch a printer.", 200);
       return page("Link not found", "Check that you copied the whole link.", 404);
     }
-    if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed", { status: 405 });
+    const chatPost = request.method === "POST" && m[2].endsWith("/chat");
+    if (request.method !== "GET" && request.method !== "HEAD" && !chatPost) return new Response("Method not allowed", { status: 405 });
+    let chatBody;
+    if (chatPost) {
+      chatBody = await request.text();
+      if (chatBody.length > 4000) return new Response("Message too big", { status: 413 });
+    }
 
     const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
     const target = `https://u${m[1]}.${domain}/share/${m[2]}${url.search}`;
 
     const headers = new Headers();
+    if (chatPost) headers.set("content-type", "application/json");
     for (const h of ["accept", "accept-language", "user-agent", "range"]) {
       const v = request.headers.get(h);
       if (v) headers.set(h, v);
@@ -42,7 +49,7 @@ export default {
 
     let res;
     try {
-      res = await fetch(target, { method: request.method, headers, redirect: "manual" });
+      res = await fetch(target, { method: request.method, headers, body: chatPost ? chatBody : undefined, redirect: "manual" });
     } catch {
       return offline(m[2]);
     }
