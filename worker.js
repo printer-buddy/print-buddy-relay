@@ -1,6 +1,6 @@
 import NEWS from "./news.json";
 
-const SHARE = /^\/share\/user\/(\d{6,10})\/(printer\/\d{1,9}\/[A-Za-z0-9_-]{20,100}(?:\/(?:status|snapshot|stream|chat))?)\/?$/;
+const SHARE = /^\/share\/user\/(\d{6,10})\/(printer\/\d{1,9}\/[A-Za-z0-9_-]{20,100}(?:\/(?:status|snapshot|stream|chat|flag))?)\/?$/;
 
 const page = (title, text, status) => new Response(
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -29,7 +29,7 @@ export default {
       if (url.pathname === "/") return page("Printer Buddy", "Self-hosted 3D printer monitoring. Open a share link to watch a printer.", 200);
       return page("Link not found", "Check that you copied the whole link.", 404);
     }
-    const chatPost = request.method === "POST" && m[2].endsWith("/chat");
+    const chatPost = request.method === "POST" && (m[2].endsWith("/chat") || m[2].endsWith("/flag"));
     if (request.method !== "GET" && request.method !== "HEAD" && !chatPost) return new Response("Method not allowed", { status: 405 });
     let chatBody;
     if (chatPost) {
