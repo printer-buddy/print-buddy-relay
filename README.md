@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/printer-buddy/printer-buddy/nightly/assets/logo.png" alt="Printer Buddy" width="160"></p>
+
 # printerbuddy.stream server (Cloudflare Worker)
 
 `worker.js` does two jobs on `www.printerbuddy.stream`:
@@ -127,3 +129,7 @@ for the next model you can pick out exactly the photos it got wrong.
 
 `./install.sh` > **2) Change setup** > **Remote access = on**. That's all.
 To manage any box yourself, use the Cloudflare dashboard (Zero Trust > Networks > Tunnels, and DNS).
+
+## License
+
+Copyright (C) 2026 sterling motuz. Licensed under the GNU Affero General Public License v3.0 only (AGPL-3.0-only), with extra terms: keep the licence header in each file, and include a CHANGELOG of any changes. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The Printer Buddy name and logo are not covered by the licence.
