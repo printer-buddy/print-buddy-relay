@@ -244,7 +244,7 @@ async function contributeApi(request, env) {
   let bytes;
   try { bytes = Uint8Array.from(atob(String(b.image || "")), c => c.charCodeAt(0)); }
   catch { return json({ error: "image must be base64" }, 400); }
-  if (bytes.length < 1000 || bytes.length > 500_000) return json({ error: "image must be 1-500 KB" }, 400);
+  if (bytes.length < 1000 || bytes.length > 1_000_000) return json({ error: "image must be 1 KB to 1 MB" }, 400);
   if (bytes[0] !== 0xFF || bytes[1] !== 0xD8) return json({ error: "image must be a JPEG" }, 400);
 
   const day = new Date().toISOString().slice(0, 10);
