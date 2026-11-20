@@ -227,7 +227,10 @@ async function tunnelApi(request, env, ctx, url) {
 // The Worker commits it to the private data repo as incoming/<label>/<id>-<time>-<source>-<score>-...jpg
 // (full details in the commit message). Boxes never get any GitHub access themselves.
 
-const LABELS = ["ok", "spaghetti", "warping", "first_layer", "failure", "stringing", "blob", "crack"];
+const LABELS = ["ok", "spaghetti", "warping", "first_layer", "failure", "stringing", "blob"];
+// labels that were dropped: older Printer Buddy versions may still send them. They're answered "sent" and
+// thrown away (nothing stored), because a refused photo would hold up every photo queued after it.
+const RETIRED_LABELS = ["crack"];
 const SOURCES = ["alert_yes", "alert_no", "print_ok", "print_failed", "user"];
 const VERDICTS = ["right", "false_alarm", "missed"];
 
@@ -238,6 +241,7 @@ async function contributeApi(request, env) {
   try { b = await request.json(); } catch { return json({ error: "Bad request" }, 400); }
   const id = String(b.id || ""), label = String(b.label || ""), source = String(b.source || "user");
   if (!/^\d{6,10}$/.test(id)) return json({ error: "Bad Printer Buddy ID" }, 400);
+  if (RETIRED_LABELS.includes(label)) return json({ ok: true, note: `${label} photos are no longer collected` }, 201);
   if (!LABELS.includes(label)) return json({ error: `label must be one of: ${LABELS.join(", ")}` }, 400);
   if (!SOURCES.includes(source)) return json({ error: "Bad source" }, 400);
 
