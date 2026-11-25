@@ -32,6 +32,9 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === "/api/tunnel") return tunnelApi(request, env, ctx, url);
+    if (url.pathname === "/api/box") return boxApi(request, env);
+    if (url.pathname === "/api/register") return registerApi(request, env);
+    if (["/api/app", "/api/app/ids", "/api/app/off", "/api/app/on"].includes(url.pathname)) return appApi(request, env, url.pathname);
     if (url.pathname === "/api/contribute") return contributeApi(request, env);
     if (url.pathname === "/api/ai-stats") return statsApi(env);
     if (url.pathname === "/api/news") return newsApi();
@@ -76,7 +79,8 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(dailySummary(env));
+    ctx.waitUntil(event.cron === "0 13 * * *" ? Promise.all([dailySummary(env), cleanupIds(env)])
+                                              : cleanupTunnels(env, new URL("https://" + (env.SHARE_DOMAIN || "printerbuddy.stream"))));
   },
 };
 
@@ -88,12 +92,16 @@ function offline(path) {
   return page("Printer is offline", "This printer's box isn't reachable right now. Try again in a little while.", 503);
 }
 
-// A box asks for its tunnel:   POST   /api/tunnel  {"id": "1234567", "port": 8080, "key": "<box key, after the first time>"}
+// A box gets its ID at install:  POST /api/box  {}  -> {"id": "1234567", "key": "..."}   (5 new IDs per network per day)
+//   A box from before this sends its own ID (and its tunnel key if it has a tunnel) to keep that ID: {"id", "key"}.
+// A box asks for its tunnel:   POST   /api/tunnel  {"id": "1234567", "port": 8080, "key": "<box key>"}
 //   -> creates tunnel "pb-u<id>" routing https://u<id>.<domain>/share/... to http://localhost:<port>,
-//      plus the DNS record, and returns {"token", "key", "hostname"}. Asking again (with the key) reuses
-//      the same tunnel and updates the port if it changed.
-// A box removes its tunnel:    DELETE /api/tunnel  {"id": "...", "key": "..."}
-// Only the box holding the key can change or delete its tunnel.
+//      plus the DNS record, and returns {"token", "hostname"}. Asking again reuses the same tunnel and
+//      updates the port if it changed, or re-creates it if it was removed while held.
+// A box removes its tunnel:    DELETE /api/tunnel  {"id": "...", "key": "...", "hold": true|false}
+//   hold: true keeps its spot on the network while it's not sharing; false gives it up (Remote access off).
+// Only the box holding the key can change, delete or get back its tunnel.
+// One box sharing at a time per network, 5 for boxes on the allow list (/api/register).
 
 const json = (data, status = 200) => new Response(JSON.stringify(data),
   { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
@@ -145,6 +153,72 @@ async function pointDns(env, host, tunnelId) {
   return cf(env, "POST", `/zones/${env.CF_ZONE_ID}/dns_records`, rec);
 }
 
+// IPv4 counts per address, IPv6 per /64 (one home gets a whole /64)
+function networkOf(ip) {
+  if (!ip.includes(":")) return ip;
+  const [head, tail = ""] = ip.split("::");
+  const h = head ? head.split(":") : [], t = tail ? tail.split(":") : [];
+  const full = [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill("0"), ...t];
+  return full.slice(0, 4).map(x => (parseInt(x, 16) || 0).toString(16)).join(":") + "::/64";
+}
+
+async function netGet(env, net) {
+  return (await env.BOXES.get(`net:${net}`, "json")) || { n: 0 };
+}
+
+// id:<id> = an ID the relay handed out, with its key. Boxes set up before that are known by their tunnel record.
+async function owner(env, id) {
+  return (await env.BOXES.get(`id:${id}`, "json")) || (await env.BOXES.get(`box:${id}`, "json"))
+      || (await env.BOXES.get(`held:${id}`, "json"));
+}
+
+async function appOff(env, own) {
+  return !!own.app && !!(await env.BOXES.get(`app:${own.app}`, "json"))?.off;
+}
+
+async function freeId(env) {
+  for (let i = 0; i < 10; i++) {
+    const r = new Uint32Array(1);
+    crypto.getRandomValues(r);
+    const c = String(1000000 + r[0] % 9000000);
+    if (!(await owner(env, c))) return c;
+  }
+  return null;
+}
+
+async function markUsed(env, id) {
+  const rec = await env.BOXES.get(`id:${id}`, "json");
+  if (rec && !rec.used) await env.BOXES.put(`id:${id}`, JSON.stringify({ ...rec, used: true }), { metadata: { created: rec.created, used: true } });
+}
+
+async function freeSlot(env, box) {
+  if (box.net) {
+    const n = await netGet(env, box.net);
+    n.n = Math.max(0, n.n - 1);
+    await env.BOXES.put(`net:${box.net}`, JSON.stringify(n));
+  }
+  const total = Number(await env.BOXES.get("count") || 0);
+  await env.BOXES.put("count", String(Math.max(0, total - 1)));
+}
+
+async function removeTunnel(env, host, tunnelId) {
+  await cf(env, "DELETE", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}`);
+  const rec = await dnsRecord(env, host);
+  if (rec) await cf(env, "DELETE", `/zones/${env.CF_ZONE_ID}/dns_records/${rec.id}`);
+}
+
+async function makeTunnel(env, id, host, port) {
+  const t = await cf(env, "POST", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel`, { name: `pb-u${id}`, config_src: "cloudflare" });
+  try {
+    await routing(env, t.id, host, port);
+    await pointDns(env, host, t.id);
+  } catch (e) {
+    await removeTunnel(env, host, t.id).catch(() => {});
+    throw e;
+  }
+  return t;
+}
+
 async function tunnelApi(request, env, ctx, url) {
   if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.CF_ZONE_ID || !env.BOXES) {
     return json({ error: "Automatic setup isn't configured on this server yet." }, 503);
@@ -156,28 +230,36 @@ async function tunnelApi(request, env, ctx, url) {
   if (!/^\d{6,10}$/.test(id)) return json({ error: "Bad Printer Buddy ID" }, 400);
   const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
   const host = `u${id}.${domain}`;
-  const kvKey = `box:${id}`;
+  const kvKey = `box:${id}`, heldKey = `held:${id}`;
   const box = await env.BOXES.get(kvKey, "json");
+  const held = box ? null : await env.BOXES.get(heldKey, "json");
+  const keyHash = typeof b.key === "string" ? await sha256(b.key) : null;
+  const own = (await env.BOXES.get(`id:${id}`, "json")) || box || held;
 
-  if (box && (typeof b.key !== "string" || (await sha256(b.key)) !== box.key_hash)) {
+  if (!own) return json({ error: "This Printer Buddy ID wasn't handed out by the relay. Update Printer Buddy to get a box ID." }, 403);
+  if ((box && keyHash !== box.key_hash) || (held && keyHash !== held.key_hash) || keyHash !== own.key_hash) {
     return json({ error: "This Printer Buddy ID is already set up on another box (or this box lost its key). " +
-                        "Remove PB_USER_ID and PB_TUNNEL_KEY from printer-buddy.env to get a new ID." }, 403);
+                        "Remove PB_USER_ID, PB_BOX_KEY and PB_TUNNEL_KEY from printer-buddy.env to get a new ID." }, 403);
   }
 
   try {
     if (request.method === "DELETE") {
-      if (!box) return json({ ok: true, note: "nothing to remove" });
-      const rec = await dnsRecord(env, host);
-      if (rec) await cf(env, "DELETE", `/zones/${env.CF_ZONE_ID}/dns_records/${rec.id}`);
+      if (!box) {
+        if (held && b.hold !== true) await env.BOXES.delete(heldKey);
+        return json({ ok: true, note: "nothing to remove" });
+      }
       try {
-        await cf(env, "DELETE", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${box.tunnel_id}`);
+        await removeTunnel(env, host, box.tunnel_id);
       } catch (e) {
         return json({ error: `The tunnel is still connected. Stop cloudflared on the box and try again in a minute. (${e.message})` }, 409);
       }
       await env.BOXES.delete(kvKey);
+      if (b.hold === true) await env.BOXES.put(heldKey, JSON.stringify({ key_hash: box.key_hash, net: box.net || null, held: Date.now() }));
+      await freeSlot(env, box);
       return json({ ok: true });
     }
 
+    if (await appOff(env, own)) return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
     const port = Number(b.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) return json({ error: "Bad port" }, 400);
 
@@ -191,34 +273,196 @@ async function tunnelApi(request, env, ctx, url) {
       return json({ token: box.token, hostname: host });
     }
 
-    const ip = request.headers.get("cf-connecting-ip") || "unknown";
-    const day = new Date().toISOString().slice(0, 10);
-    const ipKey = `ip:${ip}:${day}`;
-    const perIp = Number(await env.BOXES.get(ipKey) || 0);
-    if (perIp >= Number(env.NEW_PER_IP_PER_DAY || 5)) return json({ error: "Too many new boxes from this network today. Try again tomorrow." }, 429);
     const total = Number(await env.BOXES.get("count") || 0);
     if (total >= Number(env.MAX_TUNNELS || 500)) return json({ error: "Wireless sharing is full right now. Please tell the Printer Buddy team." }, 503);
 
-    const t = await cf(env, "POST", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel`, { name: `pb-u${id}`, config_src: "cloudflare" });
-    await routing(env, t.id, host, port);
-    await pointDns(env, host, t.id);
+    const net = held ? held.net : networkOf(request.headers.get("cf-connecting-ip") || "unknown");
+    const netInfo = net ? await netGet(env, net) : { n: 0 };
+    if (!held) {
+      const allowed = !!(await env.BOXES.get(`allowed:${id}`));
+      const limit = allowed ? Number(env.REGISTERED_PER_NETWORK || 5) : 1;
+      if (netInfo.n >= limit) {
+        return json({ error: allowed ? `This network already has ${limit} boxes sharing.`
+                                     : "This network already has a box sharing. Register this box with /register <box ID> in the Printer Buddy Discord to share up to 5 on one network." }, 429);
+      }
+    }
 
-    const key = newKey();
-    await env.BOXES.put(kvKey, JSON.stringify({ tunnel_id: t.id, token: t.token, key_hash: await sha256(key),
-                                                port, created: Date.now(), updated: Date.now() }));
-    await env.BOXES.put(ipKey, String(perIp + 1), { expirationTtl: 2 * 24 * 3600 });
+    const t = await makeTunnel(env, id, host, port);
+    await env.BOXES.put(kvKey, JSON.stringify({ tunnel_id: t.id, token: t.token, key_hash: own.key_hash,
+                                                port, net, created: Date.now(), updated: Date.now() }));
+    if (held) await env.BOXES.delete(heldKey);
+    if (net) await env.BOXES.put(`net:${net}`, JSON.stringify({ n: netInfo.n + 1 }));
     await env.BOXES.put("count", String(total + 1));
+    await markUsed(env, id);
 
-    if (env.DISCORD_WEBHOOK) {
+    if (env.DISCORD_WEBHOOK && !held) {
       ctx.waitUntil(fetch(env.DISCORD_WEBHOOK, {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ content: `Box ${id} set up wireless sharing!` }),
       }).catch(() => {}));
     }
-    return json({ token: t.token, key, hostname: host }, 201);
+    return json({ token: t.token, hostname: host }, held ? 200 : 201);
   } catch (e) {
     return json({ error: `Cloudflare said: ${e.message}` }, 502);
   }
+}
+
+async function boxApi(request, env) {
+  if (!env.BOXES) return json({ error: "Box IDs aren't set up on this server yet." }, 503);
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  let b;
+  try { b = await request.json(); } catch { b = {}; }
+  const net = networkOf(request.headers.get("cf-connecting-ip") || "unknown");
+  const dayKey = `boxday:${net}:${new Date().toISOString().slice(0, 10)}`;
+  const today = Number(await env.BOXES.get(dayKey) || 0);
+  if (today >= Number(env.BOXES_PER_NETWORK_PER_DAY || 5)) return json({ error: "Too many new box IDs from this network today. Try again tomorrow." }, 429);
+
+  let id, key, used = false;
+  if (b && b.id !== undefined) {
+    id = String(b.id);
+    if (!/^\d{6,10}$/.test(id)) return json({ error: "Bad Printer Buddy ID" }, 400);
+    if (await env.BOXES.get(`id:${id}`)) return json({ error: "This Printer Buddy ID already belongs to a box." }, 409);
+    const old = await owner(env, id);
+    if (old && (typeof b.key !== "string" || await sha256(b.key) !== old.key_hash)) {
+      return json({ error: "This Printer Buddy ID is already set up on another box (or this box lost its key)." }, 403);
+    }
+    key = old ? b.key : newKey();
+    used = !!old;
+  } else {
+    id = await freeId(env);
+    if (!id) return json({ error: "Couldn't pick a free box ID, try again." }, 503);
+    key = newKey();
+  }
+  const created = Date.now();
+  await env.BOXES.put(`id:${id}`, JSON.stringify({ key_hash: await sha256(key), created, used }), { metadata: { created, used } });
+  await env.BOXES.put(dayKey, String(today + 1), { expirationTtl: 2 * 24 * 3600 });
+  return json({ id, key }, 201);
+}
+
+// The Discord bot puts a box on the allow list:  POST /api/register  {"id": "1234567"}  (authorization: Bearer <REGISTER_SECRET>)
+async function registerApi(request, env) {
+  if (!env.REGISTER_SECRET || !env.BOXES) return json({ error: "Registering isn't set up on this server yet." }, 503);
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  if (request.headers.get("authorization") !== `Bearer ${env.REGISTER_SECRET}`) return json({ error: "Not allowed" }, 403);
+  let b;
+  try { b = await request.json(); } catch { return json({ error: "Bad request" }, 400); }
+  const id = String(b.id || "");
+  if (!/^\d{6,10}$/.test(id)) return json({ error: "Bad Printer Buddy ID" }, 400);
+  if (!(await owner(env, id))) return json({ error: "No box has that ID." }, 404);
+  await env.BOXES.put(`allowed:${id}`, "1");
+  await markUsed(env, id);
+  return json({ ok: true, id });
+}
+
+// Other programs that use the relay register as an app, and every box ID they get remembers the app:
+//   POST /api/app               {"name"}  (Bearer REGISTER_SECRET) -> {"name", "key"}
+//   POST /api/app/ids           {"name", "key"}                     -> {"ids": [{"id", "key"}, ...]}  its 50 box IDs, once
+//   POST /api/app/off | /on     {"name"}  (Bearer REGISTER_SECRET)  every box ID from that app is refused / allowed again
+async function appApi(request, env, path) {
+  if (!env.REGISTER_SECRET || !env.BOXES) return json({ error: "Apps aren't set up on this server yet." }, 503);
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  let b;
+  try { b = await request.json(); } catch { return json({ error: "Bad request" }, 400); }
+  const name = String(b.name || "").toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{1,39}$/.test(name)) return json({ error: "App name: 2 to 40 letters, numbers, - or _" }, 400);
+  const appKey = `app:${name}`, app = await env.BOXES.get(appKey, "json");
+
+  if (path === "/api/app/ids") {
+    if (!app || typeof b.key !== "string" || await sha256(b.key) !== app.key_hash) return json({ error: "App name and key don't match." }, 403);
+    if (app.off) return json({ error: "This app has been turned off by Printer Buddy." }, 403);
+    if (app.ids) return json({ error: "This app already got its box IDs." }, 409);
+    const ids = [], created = Date.now();
+    for (let i = 0; i < Number(env.APP_IDS || 50); i++) {
+      const id = await freeId(env);
+      if (!id) break;
+      const key = newKey();
+      await env.BOXES.put(`id:${id}`, JSON.stringify({ key_hash: await sha256(key), created, used: false, app: name }), { metadata: { created, used: false } });
+      ids.push({ id, key });
+    }
+    await env.BOXES.put(appKey, JSON.stringify({ ...app, ids: ids.length }));
+    return json({ ids }, 201);
+  }
+
+  if (request.headers.get("authorization") !== `Bearer ${env.REGISTER_SECRET}`) return json({ error: "Not allowed" }, 403);
+  if (path === "/api/app") {
+    if (app) return json({ error: "That app is already registered." }, 409);
+    const key = newKey();
+    await env.BOXES.put(appKey, JSON.stringify({ key_hash: await sha256(key), created: Date.now(), ids: 0, off: false }));
+    return json({ name, key }, 201);
+  }
+  if (!app) return json({ error: "No app has that name." }, 404);
+  await env.BOXES.put(appKey, JSON.stringify({ ...app, off: path === "/api/app/off" }));
+  return json({ ok: true, name, off: path === "/api/app/off" });
+}
+
+async function listAll(env, prefix) {
+  const out = [];
+  let cursor;
+  do {
+    const page = await env.BOXES.list({ prefix, cursor });
+    out.push(...page.keys.map(k => k.name));
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+  return out;
+}
+
+// Hourly: remove tunnels that never connected within an hour (freed), and tunnels offline for 4 days
+// (ID held for the box). Delete leftover pb-u tunnels with no record, then recount the slots.
+async function cleanupTunnels(env, url) {
+  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.CF_ZONE_ID || !env.BOXES) return;
+  const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
+  const now = Date.now(), HOUR = 3600 * 1000;
+  const tunnels = new Map();
+  for (let page = 1; ; page++) {
+    const list = await cf(env, "GET", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=1000&page=${page}`);
+    for (const t of list || []) if (/^pb-u\d{6,10}$/.test(t.name)) tunnels.set(t.name, t);
+    if (!list || list.length < 1000) break;
+  }
+
+  const nets = {};
+  let count = 0;
+  for (const kvKey of await listAll(env, "box:")) {
+    const id = kvKey.slice(4), box = await env.BOXES.get(kvKey, "json");
+    if (!box) continue;
+    const t = tunnels.get(`pb-u${id}`);
+    tunnels.delete(`pb-u${id}`);
+    const neverConnected = t && t.status === "inactive" && now - Date.parse(t.created_at) > HOUR;
+    const offline = t && t.status === "down" && t.conns_inactive_at && now - Date.parse(t.conns_inactive_at) > 4 * 24 * HOUR;
+    if (!t || neverConnected || offline) {
+      if (t) { try { await removeTunnel(env, `u${id}.${domain}`, t.id); } catch { continue; } }
+      await env.BOXES.delete(kvKey);
+      if (offline) await env.BOXES.put(`held:${id}`, JSON.stringify({ key_hash: box.key_hash, net: box.net || null, held: now }));
+      continue;
+    }
+    count++;
+    if (box.net) nets[box.net] = (nets[box.net] || 0) + 1;
+  }
+
+  for (const [name, t] of tunnels) {
+    if (now - Date.parse(t.created_at) < HOUR) continue;
+    try { await removeTunnel(env, `${name.slice(3)}.${domain}`, t.id); } catch {}
+  }
+
+  for (const netKey of await listAll(env, "net:")) {
+    const net = netKey.slice(4), cur = (await env.BOXES.get(netKey, "json")) || { n: 0 };
+    const n = nets[net] || 0;
+    if (cur.n !== n) await env.BOXES.put(netKey, JSON.stringify({ n }));
+  }
+  await env.BOXES.put("count", String(count));
+}
+
+// Daily: delete box IDs that were never used (no tunnel, no photo, not registered) 30 days after they were handed out.
+async function cleanupIds(env) {
+  if (!env.BOXES) return;
+  const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+  let cursor;
+  do {
+    const page = await env.BOXES.list({ prefix: "id:", cursor });
+    for (const k of page.keys) {
+      if (k.metadata && !k.metadata.used && k.metadata.created < cutoff) await env.BOXES.delete(k.name);
+    }
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
 }
 
 // A box that opted in ("Help improve the AI") sends one labelled photo:
@@ -241,6 +485,12 @@ async function contributeApi(request, env) {
   try { b = await request.json(); } catch { return json({ error: "Bad request" }, 400); }
   const id = String(b.id || ""), label = String(b.label || ""), source = String(b.source || "user");
   if (!/^\d{6,10}$/.test(id)) return json({ error: "Bad Printer Buddy ID" }, 400);
+  const own = await owner(env, id);
+  if (!own || typeof b.key !== "string" || await sha256(b.key) !== own.key_hash) {
+    return json({ error: "This box ID and key don't match. Update Printer Buddy to get a box ID." }, 403);
+  }
+  if (await appOff(env, own)) return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
+  await markUsed(env, id);
   if (RETIRED_LABELS.includes(label)) return json({ ok: true, note: `${label} photos are no longer collected` }, 201);
   if (!LABELS.includes(label)) return json({ error: `label must be one of: ${LABELS.join(", ")}` }, 400);
   if (!SOURCES.includes(source)) return json({ error: "Bad source" }, 400);

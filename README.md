@@ -2,15 +2,21 @@
 
 # printerbuddy.stream server (Cloudflare Worker)
 
-`worker.js` does two jobs on `www.printerbuddy.stream`:
+`worker.js` does three jobs on `www.printerbuddy.stream`:
 
 1. **Share relay** - `/share/user/<ID>/printer/...` is fetched through that box's tunnel, so viewers never see the box's home address.
-2. **Automatic tunnels** - `/api/tunnel` lets a box set up its own tunnel (installer: turn Remote access on in Change setup).
+2. **Box IDs** - `/api/box` hands a new box its ID and key at install. The key goes with every tunnel request and photo.
+3. **Automatic tunnels** - `/api/tunnel` lets a box set up its own tunnel (installer: turn Remote access on in Change setup).
    It creates tunnel `pb-u<ID>`, routes `https://u<ID>.printerbuddy.stream/share/...` to the box, makes the DNS record,
    and posts **"Box 1234567 set up wireless sharing!"** to Discord.
 
-Only the box that created a tunnel (it keeps a key in `printer-buddy.env` as `PB_TUNNEL_KEY`) can change its port or remove it.
-Limits: one tunnel per ID, 5 new tunnels per network per day, 500 in total (both changeable below).
+Only the box with the ID's key (kept in `printer-buddy.env` as `PB_BOX_KEY`) can set up, change, remove or get back its tunnel.
+Limits: 5 new box IDs per network per day, one tunnel per ID, one box sharing at a time per network (IPv6 counts per /64),
+5 for boxes on the allow list (`/register <box ID>` in the Discord), 500 in total. Removing a tunnel gives its slot back.
+Every hour the Worker removes tunnels that never connected within an hour, and tunnels offline for 4 days (that box gets the
+same address back next time). Every day it deletes box IDs that were never used 30 days after they were handed out.
+Other programs that use the relay register as an app and get 50 box IDs; each ID remembers its app, and turning an app off
+stops every ID it got (tunnels and photos).
 
 ## Automatic deploys
 
@@ -50,20 +56,40 @@ Open the `printer-buddy-share` Worker (see the top of `worker.js` if it doesn't 
 | Variables and Secrets (type **Text**) | `CF_ACCOUNT_ID` | from step 2 |
 | Variables and Secrets (type **Text**) | `CF_ZONE_ID` | from step 2 |
 | Variables and Secrets (type **Text**) | `SHARE_DOMAIN` | `printerbuddy.stream` |
+| Variables and Secrets (type **Secret**) | `REGISTER_SECRET` | any long random text; the Discord bot sends it to put a box on the allow list |
 | optional (Text) | `MAX_TUNNELS` | default `500` |
-| optional (Text) | `NEW_PER_IP_PER_DAY` | default `5` |
+| optional (Text) | `REGISTERED_PER_NETWORK` | default `5` |
+| optional (Text) | `BOXES_PER_NETWORK_PER_DAY` | default `5` |
+| optional (Text) | `APP_IDS` | box IDs per app, default `50` |
+
+The Discord bot puts a box on the allow list with
+`curl -s -X POST https://www.printerbuddy.stream/api/register -H "authorization: Bearer <REGISTER_SECRET>" -H 'content-type: application/json' -d '{"id": "1234567"}'` → `{"ok": true, "id": "1234567"}`.
+
+Apps (all `POST` with `content-type: application/json`):
+
+| Endpoint | Body | Needs | Reply |
+|---|---|---|---|
+| `/api/app` | `{"name": "someapp"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"name", "key"}` (the app's key, shown once) |
+| `/api/app/ids` | `{"name", "key"}` | the app's key | `{"ids": [{"id", "key"}, ...]}`, its 50 box IDs, once |
+| `/api/app/off`, `/api/app/on` | `{"name"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"ok": true, "name", "off"}` |
 
 The route `www.printerbuddy.stream/*` must point at this Worker (it already does if share links work).
 
 ## Test it
 
-This makes a **real** tunnel named `pb-u1234567` (you'll see it in Zero Trust > Networks > Tunnels, and the Discord post):
+Get a box ID:
 
 ```bash
-curl -s -X POST https://www.printerbuddy.stream/api/tunnel -H 'content-type: application/json' -d '{"id": "1234567", "port": 8080}'
+curl -s -X POST https://www.printerbuddy.stream/api/box -H 'content-type: application/json' -d '{}'
 ```
 
-Expected: `{"token": "...", "key": "...", "hostname": "u1234567.printerbuddy.stream"}`. Remove it again with the key it gave you:
+Expected: `{"id": "1234567", "key": "..."}`. This makes a **real** tunnel named `pb-u1234567` (you'll see it in Zero Trust > Networks > Tunnels, and the Discord post):
+
+```bash
+curl -s -X POST https://www.printerbuddy.stream/api/tunnel -H 'content-type: application/json' -d '{"id": "1234567", "port": 8080, "key": "<key from above>"}'
+```
+
+Expected: `{"token": "...", "hostname": "u1234567.printerbuddy.stream"}`. Remove it again:
 
 ```bash
 curl -s -X DELETE https://www.printerbuddy.stream/api/tunnel -H 'content-type: application/json' -d '{"id": "1234567", "key": "<key from above>"}'
@@ -73,7 +99,10 @@ curl -s -X DELETE https://www.printerbuddy.stream/api/tunnel -H 'content-type: a
 |---|---|
 | `Automatic setup isn't configured on this server yet.` | a setting from step 5 is missing (or the KV binding isn't named `BOXES`) |
 | `Cloudflare said: ... Authentication error` | the API token is wrong or lacks a permission from step 1 |
-| `This Printer Buddy ID is already set up on another box` | that ID has a tunnel and the key didn't match |
+| `This Printer Buddy ID wasn't handed out by the relay` | get a box ID from `/api/box` first |
+| `This Printer Buddy ID is already set up on another box` | the key didn't match that ID |
+| `This network already has a box sharing` | another box on that network is sharing; register this box with `/register <box ID>` in the Discord |
+| `Too many new box IDs from this network today` | 5 IDs per network per day; try tomorrow |
 | `The tunnel is still connected` (on DELETE) | stop cloudflared on that box, wait a minute, try again |
 
 ## Training photos (`/api/contribute`)
@@ -108,7 +137,7 @@ Commits a real photo to the data repo (delete it there afterwards):
 
 ```bash
 curl -s -X POST https://www.printerbuddy.stream/api/contribute -H 'content-type: application/json' \
-  -d "{\"id\": \"1234567\", \"label\": \"ok\", \"source\": \"user\", \"image\": \"$(base64 -w0 some-photo.jpg)\"}"
+  -d "{\"id\": \"1234567\", \"key\": \"<box key>\", \"label\": \"ok\", \"source\": \"user\", \"image\": \"$(base64 -w0 some-photo.jpg)\"}"
 ```
 
 Expected: `{"ok": true, "path": "incoming/ok/1234567-...jpg"}`. Labels: `ok, spaghetti, warping, first_layer, failure, stringing, blob, crack`.

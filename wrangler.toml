@@ -32,6 +32,6 @@ kv_namespaces = [
   { binding = "BOXES", id = "bf28f11d28de4b8c983948066e4b038e" },
 ]
 
-# daily AI report to Discord at 13:00 UTC
+# daily AI report to Discord and unused box ID cleanup at 13:00 UTC; tunnel cleanup every hour at :30
 [triggers]
-crons = ["0 13 * * *"]
+crons = ["0 13 * * *", "30 * * * *"]
