@@ -34,7 +34,7 @@ export default {
     if (url.pathname === "/api/tunnel") return tunnelApi(request, env, ctx, url);
     if (url.pathname === "/api/box") return boxApi(request, env);
     if (url.pathname === "/api/register") return registerApi(request, env);
-    if (["/api/app", "/api/app/ids", "/api/app/off", "/api/app/on"].includes(url.pathname)) return appApi(request, env, url.pathname);
+    if (["/api/app", "/api/app/ids", "/api/app/off", "/api/app/on"].includes(url.pathname)) return appApi(request, env, url);
     if (url.pathname === "/api/contribute") return contributeApi(request, env);
     if (url.pathname === "/api/ai-stats") return statsApi(env);
     if (url.pathname === "/api/news") return newsApi();
@@ -99,7 +99,7 @@ function offline(path) {
 //      plus the DNS record, and returns {"token", "hostname"}. Asking again reuses the same tunnel and
 //      updates the port if it changed, or re-creates it if it was removed while held.
 // A box removes its tunnel:    DELETE /api/tunnel  {"id": "...", "key": "...", "hold": true|false}
-//   hold: true keeps its spot on the network while it's not sharing; false gives it up (Remote access off).
+//   hold: true keeps its address for that box while it's not sharing; false gives it up (Remote access off).
 // Only the box holding the key can change, delete or get back its tunnel.
 // One box sharing at a time per network, 5 for boxes on the allow list (/api/register).
 
@@ -173,7 +173,7 @@ async function owner(env, id) {
 }
 
 async function appOff(env, own) {
-  return !!own.app && !!(await env.BOXES.get(`app:${own.app}`, "json"))?.off;
+  return !!own.app && !!(await env.BOXES.get(`appoff:${own.app}`));
 }
 
 async function freeId(env) {
@@ -205,6 +205,16 @@ async function removeTunnel(env, host, tunnelId) {
   await cf(env, "DELETE", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}`);
   const rec = await dnsRecord(env, host);
   if (rec) await cf(env, "DELETE", `/zones/${env.CF_ZONE_ID}/dns_records/${rec.id}`);
+}
+
+async function cutTunnel(env, host, tunnelId) {
+  try {
+    await removeTunnel(env, host, tunnelId);
+  } catch {
+    await cf(env, "PUT", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}/configurations`, { config: { ingress: [{ service: "http_status:404" }] } });
+    const rec = await dnsRecord(env, host);
+    if (rec) await cf(env, "DELETE", `/zones/${env.CF_ZONE_ID}/dns_records/${rec.id}`);
+  }
 }
 
 async function makeTunnel(env, id, host, port) {
@@ -276,22 +286,20 @@ async function tunnelApi(request, env, ctx, url) {
     const total = Number(await env.BOXES.get("count") || 0);
     if (total >= Number(env.MAX_TUNNELS || 500)) return json({ error: "Wireless sharing is full right now. Please tell the Printer Buddy team." }, 503);
 
-    const net = held ? held.net : networkOf(request.headers.get("cf-connecting-ip") || "unknown");
-    const netInfo = net ? await netGet(env, net) : { n: 0 };
-    if (!held) {
-      const allowed = !!(await env.BOXES.get(`allowed:${id}`));
-      const limit = allowed ? Number(env.REGISTERED_PER_NETWORK || 5) : 1;
-      if (netInfo.n >= limit) {
-        return json({ error: allowed ? `This network already has ${limit} boxes sharing.`
-                                     : "This network already has a box sharing. Register this box with /register <box ID> in the Printer Buddy Discord to share up to 5 on one network." }, 429);
-      }
+    const net = networkOf(request.headers.get("cf-connecting-ip") || "unknown");
+    const netInfo = await netGet(env, net);
+    const allowed = !!(await env.BOXES.get(`allowed:${id}`));
+    const limit = allowed ? Number(env.REGISTERED_PER_NETWORK || 5) : 1;
+    if (netInfo.n >= limit) {
+      return json({ error: allowed ? `This network already has ${limit} boxes sharing.`
+                                   : "This network already has a box sharing. Register this box with /register <box ID> in the Printer Buddy Discord to share up to 5 on one network." }, 429);
     }
 
     const t = await makeTunnel(env, id, host, port);
     await env.BOXES.put(kvKey, JSON.stringify({ tunnel_id: t.id, token: t.token, key_hash: own.key_hash,
                                                 port, net, created: Date.now(), updated: Date.now() }));
     if (held) await env.BOXES.delete(heldKey);
-    if (net) await env.BOXES.put(`net:${net}`, JSON.stringify({ n: netInfo.n + 1 }));
+    await env.BOXES.put(`net:${net}`, JSON.stringify({ n: netInfo.n + 1 }));
     await env.BOXES.put("count", String(total + 1));
     await markUsed(env, id);
 
@@ -358,7 +366,8 @@ async function registerApi(request, env) {
 //   POST /api/app               {"name"}  (Bearer REGISTER_SECRET) -> {"name", "key"}
 //   POST /api/app/ids           {"name", "key"}                     -> {"ids": [{"id", "key"}, ...]}  its 50 box IDs, once
 //   POST /api/app/off | /on     {"name"}  (Bearer REGISTER_SECRET)  every box ID from that app is refused / allowed again
-async function appApi(request, env, path) {
+async function appApi(request, env, url) {
+  const path = url.pathname;
   if (!env.REGISTER_SECRET || !env.BOXES) return json({ error: "Apps aren't set up on this server yet." }, 503);
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
   let b;
@@ -369,7 +378,7 @@ async function appApi(request, env, path) {
 
   if (path === "/api/app/ids") {
     if (!app || typeof b.key !== "string" || await sha256(b.key) !== app.key_hash) return json({ error: "App name and key don't match." }, 403);
-    if (app.off) return json({ error: "This app has been turned off by Printer Buddy." }, 403);
+    if (await env.BOXES.get(`appoff:${name}`)) return json({ error: "This app has been turned off by Printer Buddy." }, 403);
     if (app.ids) return json({ error: "This app already got its box IDs." }, 409);
     const ids = [], created = Date.now();
     for (let i = 0; i < Number(env.APP_IDS || 50); i++) {
@@ -387,12 +396,35 @@ async function appApi(request, env, path) {
   if (path === "/api/app") {
     if (app) return json({ error: "That app is already registered." }, 409);
     const key = newKey();
-    await env.BOXES.put(appKey, JSON.stringify({ key_hash: await sha256(key), created: Date.now(), ids: 0, off: false }));
+    await env.BOXES.put(appKey, JSON.stringify({ key_hash: await sha256(key), created: Date.now(), ids: 0 }));
     return json({ name, key }, 201);
   }
   if (!app) return json({ error: "No app has that name." }, 404);
-  await env.BOXES.put(appKey, JSON.stringify({ ...app, off: path === "/api/app/off" }));
-  return json({ ok: true, name, off: path === "/api/app/off" });
+  if (path === "/api/app/on") {
+    await env.BOXES.delete(`appoff:${name}`);
+    return json({ ok: true, name, off: false });
+  }
+  await env.BOXES.put(`appoff:${name}`, "1");
+  let removed = 0, failed = 0;
+  if (env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_ZONE_ID) {
+    const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
+    for (const kvKey of await listAll(env, "box:")) {
+      const id = kvKey.slice(4), rec = await env.BOXES.get(`id:${id}`, "json");
+      if (!rec || rec.app !== name) continue;
+      const box = await env.BOXES.get(kvKey, "json");
+      if (!box) continue;
+      try {
+        await cutTunnel(env, `u${id}.${domain}`, box.tunnel_id);
+      } catch {
+        failed++;
+        continue;
+      }
+      await env.BOXES.delete(kvKey);
+      await freeSlot(env, box);
+      removed++;
+    }
+  }
+  return json({ ok: true, name, off: true, tunnels_removed: removed, tunnels_failed: failed });
 }
 
 async function listAll(env, prefix) {
@@ -428,11 +460,15 @@ async function cleanupTunnels(env, url) {
     tunnels.delete(`pb-u${id}`);
     const neverConnected = t && t.status === "inactive" && now - Date.parse(t.created_at) > HOUR;
     const offline = t && t.status === "down" && t.conns_inactive_at && now - Date.parse(t.conns_inactive_at) > 4 * 24 * HOUR;
-    if (!t || neverConnected || offline) {
-      if (t) { try { await removeTunnel(env, `u${id}.${domain}`, t.id); } catch { continue; } }
-      await env.BOXES.delete(kvKey);
-      if (offline) await env.BOXES.put(`held:${id}`, JSON.stringify({ key_hash: box.key_hash, net: box.net || null, held: now }));
-      continue;
+    const young = !t && now - (box.created || 0) < HOUR;
+    if (!young && (!t || neverConnected || offline)) {
+      let gone = true;
+      if (t) { try { await removeTunnel(env, `u${id}.${domain}`, t.id); } catch { gone = false; } }
+      if (gone) {
+        await env.BOXES.delete(kvKey);
+        if (offline) await env.BOXES.put(`held:${id}`, JSON.stringify({ key_hash: box.key_hash, net: box.net || null, held: now }));
+        continue;
+      }
     }
     count++;
     if (box.net) nets[box.net] = (nets[box.net] || 0) + 1;

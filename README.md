@@ -83,16 +83,16 @@ Get a box ID:
 curl -s -X POST https://www.printerbuddy.stream/api/box -H 'content-type: application/json' -d '{}'
 ```
 
-Expected: `{"id": "1234567", "key": "..."}`. This makes a **real** tunnel named `pb-u1234567` (you'll see it in Zero Trust > Networks > Tunnels, and the Discord post):
+Expected: `{"id": "1234567", "key": "..."}`. This makes a **real** tunnel named `pb-u<ID>` (you'll see it in Zero Trust > Networks > Tunnels, and the Discord post):
 
 ```bash
-curl -s -X POST https://www.printerbuddy.stream/api/tunnel -H 'content-type: application/json' -d '{"id": "1234567", "port": 8080, "key": "<key from above>"}'
+curl -s -X POST https://www.printerbuddy.stream/api/tunnel -H 'content-type: application/json' -d '{"id": "<id from above>", "port": 8080, "key": "<key from above>"}'
 ```
 
-Expected: `{"token": "...", "hostname": "u1234567.printerbuddy.stream"}`. Remove it again:
+Expected: `{"token": "...", "hostname": "u<ID>.printerbuddy.stream"}`. Remove it again:
 
 ```bash
-curl -s -X DELETE https://www.printerbuddy.stream/api/tunnel -H 'content-type: application/json' -d '{"id": "1234567", "key": "<key from above>"}'
+curl -s -X DELETE https://www.printerbuddy.stream/api/tunnel -H 'content-type: application/json' -d '{"id": "<id from above>", "key": "<key from above>"}'
 ```
 
 | Reply | Meaning |
@@ -137,10 +137,10 @@ Commits a real photo to the data repo (delete it there afterwards):
 
 ```bash
 curl -s -X POST https://www.printerbuddy.stream/api/contribute -H 'content-type: application/json' \
-  -d "{\"id\": \"1234567\", \"key\": \"<box key>\", \"label\": \"ok\", \"source\": \"user\", \"image\": \"$(base64 -w0 some-photo.jpg)\"}"
+  -d "{\"id\": \"<box ID>\", \"key\": \"<box key>\", \"label\": \"ok\", \"source\": \"user\", \"image\": \"$(base64 -w0 some-photo.jpg)\"}"
 ```
 
-Expected: `{"ok": true, "path": "incoming/ok/1234567-...jpg"}`. Labels: `ok, spaghetti, warping, first_layer, failure, stringing, blob, crack`.
+Expected: `{"ok": true, "path": "incoming/ok/<box ID>-...jpg"}`. Labels: `ok, spaghetti, warping, first_layer, failure, stringing, blob, crack`.
 
 ### Was the AI right?
 
