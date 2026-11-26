@@ -274,6 +274,7 @@ async function tunnelApi(request, env, ctx, url) {
     if (!Number.isInteger(port) || port < 1 || port > 65535) return json({ error: "Bad port" }, 400);
 
     if (box) {
+      const wasCut = !!box.cut;
       if (box.port !== port || box.cut) {
         await routing(env, box.tunnel_id, host, port);
         if (box.cut) await pointDns(env, host, box.tunnel_id);
@@ -282,6 +283,11 @@ async function tunnelApi(request, env, ctx, url) {
       }
       box.updated = Date.now();
       await env.BOXES.put(kvKey, JSON.stringify(box));
+      if (wasCut && await appOff(env, own)) {
+        await env.BOXES.put(kvKey, JSON.stringify({ ...box, cut: true }));
+        await cutTunnel(env, host, box.tunnel_id).catch(() => {});
+        return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
+      }
       return json({ token: box.token, hostname: host });
     }
 
@@ -298,11 +304,16 @@ async function tunnelApi(request, env, ctx, url) {
     }
 
     const t = await makeTunnel(env, id, host, port);
-    await env.BOXES.put(kvKey, JSON.stringify({ tunnel_id: t.id, token: t.token, key_hash: own.key_hash,
-                                                port, net, created: Date.now(), updated: Date.now() }));
+    const rec = { tunnel_id: t.id, token: t.token, key_hash: own.key_hash, port, net, created: Date.now(), updated: Date.now() };
+    await env.BOXES.put(kvKey, JSON.stringify(rec));
     if (await appOff(env, own)) {
-      await removeTunnel(env, host, t.id).catch(() => {});
-      await env.BOXES.delete(kvKey);
+      try {
+        await removeTunnel(env, host, t.id);
+        await env.BOXES.delete(kvKey);
+      } catch {
+        await env.BOXES.put(kvKey, JSON.stringify({ ...rec, cut: true }));
+        await cutTunnel(env, host, t.id).catch(() => {});
+      }
       return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
     }
     if (held) await env.BOXES.delete(heldKey);
