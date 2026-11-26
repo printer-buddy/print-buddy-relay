@@ -5,7 +5,7 @@
 `worker.js` does three jobs on `www.printerbuddy.stream`:
 
 1. **Share relay** - `/share/user/<ID>/printer/...` is fetched through that box's tunnel, so viewers never see the box's home address.
-2. **Box IDs** - `/api/box` hands a new box its ID and key at install. The key goes with every tunnel request and photo.
+2. **Box IDs** - `/api/box` hands a new box its ID at install. The box makes its own key and sends it (`{"key": "<64 hex>"}`), so asking again gets the same ID; a box that sends `{}` gets a key from the relay. The key goes with every tunnel request and photo.
 3. **Automatic tunnels** - `/api/tunnel` lets a box set up its own tunnel (installer: turn Remote access on in Change setup).
    It creates tunnel `pb-u<ID>`, routes `https://u<ID>.printerbuddy.stream/share/...` to the box, makes the DNS record,
    and posts **"Box 1234567 set up wireless sharing!"** to Discord.
@@ -18,7 +18,7 @@ same address back next time). Every day it deletes box IDs that were never used 
 Other programs that use the relay register as an app and get 50 box IDs; each ID remembers its app, and turning an app off
 stops every ID it got (tunnels and photos).
 Every change to box IDs, tunnels, the allow list and apps is a job on a Cloudflare queue that runs one job at a time, so two
-changes never overlap; a request waits up to 20 seconds for its answer. On the Workers Free plan the queue takes about 3,300
+changes never overlap; a request waits about 20 seconds for its answer. On the Workers Free plan the queue takes about 3,300
 jobs a day (10,000 operations, 3 per job): one per request, plus one per box when an app is turned off or the hourly cleanup removes it.
 
 ## Automatic deploys
@@ -76,8 +76,8 @@ Apps (all `POST` with `content-type: application/json`):
 
 | Endpoint | Body | Needs | Reply |
 |---|---|---|---|
-| `/api/app` | `{"name": "someapp"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"name", "key"}` (the app's key, shown once) |
-| `/api/app/ids` | `{"name", "key"}` | the app's key | `{"ids": [{"id", "key"}, ...]}`, its 50 box IDs, once |
+| `/api/app` | `{"name": "someapp"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"name", "key"}` (the app's key; asking again gives the same key) |
+| `/api/app/ids` | `{"name", "key"}` | the app's key | `{"ids": [{"id", "key"}, ...]}`, its 50 box IDs; asking again gives the same IDs and keys |
 | `/api/app/off` | `{"name"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"ok": true, "name", "off": true, "boxes"}`; then each of those boxes' tunnels is removed (cut if still connected) in its own job |
 | `/api/app/on` | `{"name"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"ok": true, "name", "off": false}` |
 
@@ -112,7 +112,9 @@ curl -s -X DELETE https://www.printerbuddy.stream/api/tunnel -H 'content-type: a
 | `This network already has a box sharing` | another box on that network is sharing; register this box with `/register <box ID>` in the Discord |
 | `Too many new box IDs from this network today` | 5 IDs per network per day; try tomorrow |
 | `The tunnel is still connected` (on DELETE) | stop cloudflared on that box, wait a minute, try again |
-| `The Printer Buddy server is busy. Try again in a minute.` | the queue didn't answer within 20 seconds; the request still runs, and asking again is safe |
+| `The tunnel was removed, but its address couldn't be` (on DELETE) | the DNS step failed; try again in a minute |
+| `Bad box key` | a new box's own key must be 64 hex characters |
+| `The Printer Buddy server is busy. Try again in a minute.` | the queue didn't answer within about 20 seconds; the request still runs, and asking again with the same box key or app key gets its answer |
 | `The Printer Buddy server is updating. Try again in a minute.` (photos) | right after a deploy, while the box records are copied from KV into D1 |
 
 ## Training photos (`/api/contribute`)

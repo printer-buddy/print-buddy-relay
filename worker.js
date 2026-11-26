@@ -185,6 +185,7 @@ const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS box_days (net TEXT, day TEXT, n INTEGER, PRIMARY KEY (net, day))",
   "CREATE TABLE IF NOT EXISTS results (job TEXT PRIMARY KEY, status INTEGER, body TEXT, created INTEGER)",
   "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
+  "CREATE INDEX IF NOT EXISTS ids_key ON ids (key_hash)",
 ];
 let schemaReady = false;
 
@@ -205,29 +206,71 @@ const OTHER_BOX = "This Printer Buddy ID is already set up on another box (or th
 const APP_OFF = "The app this box ID came from has been turned off by Printer Buddy.";
 
 // ids = an ID the relay handed out, with its key. Boxes set up before that are known by their tunnel record.
-const OWNER = `SELECT w.key_hash, w.app, COALESCE((SELECT off FROM apps WHERE name = w.app), 0) AS off FROM (
+const OWNER = `SELECT w.r, w.key_hash, w.app, COALESCE((SELECT off FROM apps WHERE name = w.app), 0) AS off FROM (
   SELECT 1 AS r, key_hash, app FROM ids WHERE id = ?1
   UNION ALL SELECT 2, key_hash, NULL FROM boxes WHERE id = ?1
   UNION ALL SELECT 3, key_hash, NULL FROM held WHERE id = ?1) AS w ORDER BY w.r LIMIT 1`;
 const owner = (env, id) => sql(env, OWNER, id).first();
 
-async function freeIds(env, n) {
+function randomIds(count) {
   const pick = new Set();
-  while (pick.size < n + 10) {
+  while (pick.size < count) {
     const r = new Uint32Array(1);
     crypto.getRandomValues(r);
     pick.add(String(1000000 + r[0] % 9000000));
   }
-  const taken = await sql(env, "SELECT value FROM json_each(?1) WHERE value IN (SELECT id FROM ids UNION SELECT id FROM boxes UNION SELECT id FROM held)",
-                          JSON.stringify([...pick])).all();
-  const no = new Set(taken.results.map(r => r.value));
-  return [...pick].filter(c => !no.has(c)).slice(0, n);
+  return [...pick];
 }
 
+async function freeOf(env, candidates, n) {
+  const taken = await sql(env, "SELECT value FROM json_each(?1) WHERE value IN (SELECT id FROM ids UNION SELECT id FROM boxes UNION SELECT id FROM held)",
+                          JSON.stringify(candidates)).all();
+  const no = new Set(taken.results.map(r => r.value));
+  return candidates.filter(c => !no.has(c)).slice(0, n);
+}
+
+const freeIds = (env, n) => freeOf(env, randomIds(n + 10), n);
+
+// An app's key comes from REGISTER_SECRET and each of its box keys from the app's key, so asking again gets the same keys.
+async function hmac(secret, text) {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(text));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function getTunnel(env, tunnelId) {
+  try {
+    const t = await cf(env, "GET", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}`);
+    return t && !t.deleted_at ? t : null;
+  } catch (e) {
+    if (e.status === 404) return null;
+    throw e;
+  }
+}
+
+// A tunnel already deleted (an earlier try) goes straight to the DNS step. e.step says which step failed.
 async function removeTunnel(env, host, tunnelId) {
-  await cf(env, "DELETE", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}`);
-  const rec = await dnsRecord(env, host);
-  if (rec) await cf(env, "DELETE", `/zones/${env.CF_ZONE_ID}/dns_records/${rec.id}`);
+  let t;
+  try { t = await getTunnel(env, tunnelId); } catch (e) { e.step = "read"; throw e; }
+  if (t) {
+    try { await cf(env, "DELETE", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}`); } catch (e) { e.step = "delete"; throw e; }
+  }
+  try {
+    const rec = await dnsRecord(env, host);
+    if (rec) await cf(env, "DELETE", `/zones/${env.CF_ZONE_ID}/dns_records/${rec.id}`);
+  } catch (e) {
+    e.step = "dns";
+    throw e;
+  }
+}
+
+// never connected within an hour, or offline for 4 days
+function stale(t, now) {
+  const HOUR = 3600 * 1000;
+  return {
+    neverConnected: t.status === "inactive" && now - Date.parse(t.created_at) > HOUR,
+    offline: t.status === "down" && !!t.conns_inactive_at && now - Date.parse(t.conns_inactive_at) > 4 * 24 * HOUR,
+  };
 }
 
 async function cutTunnel(env, host, tunnelId) {
@@ -242,8 +285,13 @@ async function cutTunnel(env, host, tunnelId) {
   }
 }
 
+// A tunnel left from an earlier try whose record was never saved is used again instead of making a second one.
 async function makeTunnel(env, id, host, port) {
-  const t = await cf(env, "POST", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel`, { name: `pb-u${id}`, config_src: "cloudflare" });
+  const name = `pb-u${id}`;
+  const list = await cf(env, "GET", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel?name=${name}&is_deleted=false`);
+  const left = (list || []).find(x => x.name === name && !x.deleted_at);
+  const t = left ? { id: left.id, token: await cf(env, "GET", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${left.id}/token`) }
+                 : await cf(env, "POST", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel`, { name, config_src: "cloudflare" });
   try {
     await routing(env, t.id, host, port);
     await pointDns(env, host, t.id);
@@ -314,10 +362,15 @@ async function boxApi(request, env) {
     data.id = String(b.id);
     if (!/^\d{6,10}$/.test(data.id)) return json({ error: "Bad Printer Buddy ID" }, 400);
     if (typeof b.key === "string") data.given_hash = await sha256(b.key);
+  } else if (b && b.key !== undefined) {
+    // a new box sends its own key, so asking again (after "busy") gets the same ID
+    if (typeof b.key !== "string" || !/^[0-9a-f]{64}$/.test(b.key)) return json({ error: "Bad box key" }, 400);
+    data.own_hash = await sha256(b.key);
   }
   if (await ready(env)) {
-    const pre = await sql(env, "SELECT COALESCE((SELECT n FROM box_days WHERE net = ?1 AND day = ?2), 0) AS today, EXISTS(SELECT 1 FROM ids WHERE id = ?3) AS taken",
-                          net, data.day, data.id ?? null).first();
+    const pre = await sql(env, "SELECT COALESCE((SELECT n FROM box_days WHERE net = ?1 AND day = ?2), 0) AS today, EXISTS(SELECT 1 FROM ids WHERE id = ?3) AS taken, " +
+                               "(SELECT id FROM ids WHERE key_hash = ?4) AS mine", net, data.day, data.id ?? null, data.own_hash ?? null).first();
+    if (pre.mine) return json({ id: pre.mine, key: b.key }, 201);
     if (pre.today >= Number(env.BOXES_PER_NETWORK_PER_DAY || 5)) return json({ error: "Too many new box IDs from this network today. Try again tomorrow." }, 429);
     if (data.id && pre.taken) return json({ error: "This Printer Buddy ID already belongs to a box." }, 409);
   }
@@ -342,8 +395,8 @@ async function registerApi(request, env) {
 }
 
 // Other programs that use the relay register as an app, and every box ID they get remembers the app:
-//   POST /api/app               {"name"}  (Bearer REGISTER_SECRET) -> {"name", "key"}
-//   POST /api/app/ids           {"name", "key"}                     -> {"ids": [{"id", "key"}, ...]}  its 50 box IDs, once
+//   POST /api/app               {"name"}  (Bearer REGISTER_SECRET) -> {"name", "key"}  asking again gets the same key
+//   POST /api/app/ids           {"name", "key"}                     -> {"ids": [{"id", "key"}, ...]}  its 50 box IDs, the same ones every time
 //   POST /api/app/off | /on     {"name"}  (Bearer REGISTER_SECRET)  every box ID from that app is refused / allowed again
 async function appApi(request, env, url) {
   const path = url.pathname;
@@ -360,17 +413,27 @@ async function appApi(request, env, url) {
     const keyHash = typeof b.key === "string" ? await sha256(b.key) : null;
     if (!keyHash || (checked && (!app || keyHash !== app.key_hash))) return json({ error: "App name and key don't match." }, 403);
     if (checked && app.off) return json({ error: "This app has been turned off by Printer Buddy." }, 403);
-    if (checked && app.ids) return json({ error: "This app already got its box IDs." }, 409);
-    const keys = Array.from({ length: Number(env.APP_IDS || 50) }, newKey);
-    const [status, body] = await viaQueue(env, "app-ids", { name, key_hash: keyHash, hashes: await Promise.all(keys.map(sha256)) });
-    if (status !== 201) return json(body, status);
-    return json({ ids: body.ids.map((id, i) => ({ id, key: keys[i] })) }, 201);
+    const keyOf = id => hmac(b.key, id);
+    let status, ids;
+    if (checked && app.ids) {
+      status = 200;
+      const rows = (await sql(env, "SELECT id, key_hash FROM ids WHERE app = ? ORDER BY id", name).all()).results;
+      const match = await Promise.all(rows.map(async r => r.key_hash === await sha256(await keyOf(r.id))));
+      ids = rows.filter((r, i) => match[i]).map(r => r.id);
+    } else {
+      const offer = await Promise.all(randomIds(Number(env.APP_IDS || 50) + 10).map(async id => ({ id, hash: await sha256(await keyOf(id)) })));
+      let body;
+      [status, body] = await viaQueue(env, "app-ids", { name, key_hash: keyHash, n: Number(env.APP_IDS || 50), offer });
+      if (status !== 201 && status !== 200) return json(body, status);
+      ids = body.ids;
+    }
+    return json({ ids: await Promise.all(ids.map(async id => ({ id, key: await keyOf(id) }))) }, status);
   }
 
   if (request.headers.get("authorization") !== `Bearer ${env.REGISTER_SECRET}`) return json({ error: "Not allowed" }, 403);
   if (path === "/api/app") {
-    if (app) return json({ error: "That app is already registered." }, 409);
-    const key = newKey();
+    const key = await hmac(env.REGISTER_SECRET, `app:${name}`);
+    if (app) return app.key_hash === await sha256(key) ? json({ name, key }, 200) : json({ error: "That app is already registered." }, 409);
     const [status, body] = await viaQueue(env, "app", { name, key_hash: await sha256(key) });
     return status === 201 ? json({ name, key }, 201) : json(body, status);
   }
@@ -398,17 +461,18 @@ async function cleanupTunnels(env, url) {
     for (const box of boxes) {
       const t = tunnels.get(`pb-u${box.id}`);
       tunnels.delete(`pb-u${box.id}`);
-      const neverConnected = t && t.status === "inactive" && now - Date.parse(t.created_at) > HOUR;
-      const offline = t && t.status === "down" && t.conns_inactive_at && now - Date.parse(t.conns_inactive_at) > 4 * 24 * HOUR;
+      const { neverConnected, offline } = t ? stale(t, now) : {};
       const young = !t && now - (box.created || 0) < HOUR;
       if (!young && (!t || neverConnected || offline)) {
-        jobs.push({ type: "remove-box", data: { id: box.id, tunnel_id: box.tunnel_id, cf_id: t ? t.id : null, offline: !!offline, host: `u${box.id}.${domain}` } });
+        jobs.push({ type: "remove-box", data: { id: box.id, tunnel_id: box.tunnel_id, cf_id: t ? t.id : null, host: `u${box.id}.${domain}` } });
       }
     }
     for (const [name, t] of tunnels) {
       if (now - Date.parse(t.created_at) < HOUR) continue;
       jobs.push({ type: "remove-tunnel", data: { id: name.slice(4), cf_id: t.id, host: `${name.slice(3)}.${domain}` } });
     }
+    const { results: cuts } = await sql(env, "SELECT boxes.id, boxes.tunnel_id FROM boxes JOIN ids ON ids.id = boxes.id JOIN apps ON apps.name = ids.app WHERE apps.off = 1 AND boxes.cut != 1").all();
+    for (const b of cuts) jobs.push({ type: "cut-box", data: { id: b.id, tunnel_id: b.tunnel_id, host: `u${b.id}.${domain}` } });
   }
   await sendJobs(env, jobs);
 }
@@ -433,7 +497,7 @@ async function migrateStep(env) {
       writes.push(sql(env, "INSERT OR IGNORE INTO ids (id, key_hash, created, used, app) VALUES (?, ?, ?, ?, ?)", k, v.key_hash ?? null, v.created ?? 0, v.used ? 1 : 0, v.app ?? null));
     } else if (prefix === "box:") {
       writes.push(sql(env, "INSERT OR IGNORE INTO boxes (id, tunnel_id, token, key_hash, port, net, cut, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                      k, v.tunnel_id ?? null, v.token ?? null, v.key_hash ?? null, v.port ?? null, v.net ?? null, v.cut ? 1 : 0, v.created ?? 0, v.updated ?? 0));
+                      k, v.tunnel_id ?? null, v.token ?? null, v.key_hash ?? null, v.port ?? null, v.net ?? null, v.cut ? 2 : 0, v.created ?? 0, v.updated ?? 0));
     } else {
       writes.push(sql(env, "INSERT OR IGNORE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", k, v.key_hash ?? null, v.net ?? null, v.held ?? 0));
     }
@@ -515,17 +579,23 @@ const JOBS = {
     try {
       await removeTunnel(env, host, box.tunnel_id);
     } catch (e) {
-      return [409, { error: `The tunnel is still connected. Stop cloudflared on the box and try again in a minute. (${e.message})` }];
+      if (e.step === "dns") return [502, { error: `The tunnel was removed, but its address couldn't be. Try again in a minute. (${e.message})` }];
+      if (e.step === "delete") return [409, { error: `The tunnel is still connected. Stop cloudflared on the box and try again in a minute. (${e.message})` }];
+      return [502, { error: `Cloudflare said: ${e.message}` }];
     }
     const writes = [sql(env, "DELETE FROM boxes WHERE id = ?", id)];
     if (hold) writes.push(sql(env, "INSERT OR REPLACE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", id, box.key_hash, box.net, Date.now()));
     return [200, { ok: true }, writes];
   },
 
-  async box(env, { id: given, given_hash: givenHash, new_hash: newHash, net, day }) {
+  async box(env, { id: given, given_hash: givenHash, new_hash: newHash, own_hash: ownHash, net, day }) {
+    if (ownHash) {
+      const mine = await sql(env, "SELECT id FROM ids WHERE key_hash = ?", ownHash).first("id");
+      if (mine) return [201, { id: mine, key: "given" }];
+    }
     const today = (await sql(env, "SELECT n FROM box_days WHERE net = ? AND day = ?", net, day).first("n")) || 0;
     if (today >= Number(env.BOXES_PER_NETWORK_PER_DAY || 5)) return [429, { error: "Too many new box IDs from this network today. Try again tomorrow." }];
-    let id = given, hash = newHash, used = 0, key = "new";
+    let id = given, hash = ownHash || newHash, used = 0, key = ownHash ? "given" : "new";
     if (given !== undefined) {
       if (await sql(env, "SELECT 1 FROM ids WHERE id = ?", given).first()) return [409, { error: "This Printer Buddy ID already belongs to a box." }];
       const old = await owner(env, given);
@@ -547,17 +617,19 @@ const JOBS = {
   },
 
   async app(env, { name, key_hash: keyHash }) {
-    if (await sql(env, "SELECT 1 FROM apps WHERE name = ?", name).first()) return [409, { error: "That app is already registered." }];
+    const app = await sql(env, "SELECT key_hash FROM apps WHERE name = ?", name).first();
+    if (app) return app.key_hash === keyHash ? [201, { name }] : [409, { error: "That app is already registered." }];
     return [201, { name }, [sql(env, "INSERT INTO apps (name, key_hash, created, ids, off) VALUES (?, ?, ?, 0, 0)", name, keyHash, Date.now())]];
   },
 
-  async "app-ids"(env, { name, key_hash: keyHash, hashes }) {
+  async "app-ids"(env, { name, key_hash: keyHash, n, offer }) {
     const app = await sql(env, "SELECT key_hash, ids, off FROM apps WHERE name = ?", name).first();
     if (!app || keyHash !== app.key_hash) return [403, { error: "App name and key don't match." }];
     if (app.off) return [403, { error: "This app has been turned off by Printer Buddy." }];
-    if (app.ids) return [409, { error: "This app already got its box IDs." }];
-    const ids = await freeIds(env, hashes.length), created = Date.now();
-    const writes = ids.map((id, i) => sql(env, "INSERT INTO ids (id, key_hash, created, used, app) VALUES (?, ?, ?, 0, ?)", id, hashes[i], created, name));
+    if (app.ids) return [200, { ids: (await sql(env, "SELECT id FROM ids WHERE app = ? ORDER BY id", name).all()).results.map(r => r.id) }];
+    const hashOf = new Map(offer.map(o => [o.id, o.hash]));
+    const ids = await freeOf(env, offer.map(o => o.id), n), created = Date.now();
+    const writes = ids.map(id => sql(env, "INSERT INTO ids (id, key_hash, created, used, app) VALUES (?, ?, ?, 0, ?)", id, hashOf.get(id), created, name));
     writes.push(sql(env, "UPDATE apps SET ids = ? WHERE name = ?", ids.length, name));
     return [201, { ids }, writes];
   },
@@ -579,20 +651,31 @@ const JOBS = {
     return [200, { ok: true, name, off: true, boxes: boxes.length }];
   },
 
-  // A tunnel that's still connected can't be deleted: it's cut (no routing, no address) and its box marked cut.
+  // A tunnel that's still connected can't be deleted: it's cut (no routing, no address). cut = 2 while cutting, 1 once done;
+  // the hourly cleanup sends the job again for a box of a turned-off app that isn't done.
   async "cut-box"(env, { id, tunnel_id: tunnelId, host }) {
     const box = await sql(env, "SELECT tunnel_id FROM boxes WHERE id = ?", id).first();
     const own = await owner(env, id);
     if (!box || box.tunnel_id !== tunnelId || !own || !own.off) return [200, { ok: true, note: "nothing to cut" }];
-    await sql(env, "UPDATE boxes SET cut = 1 WHERE id = ?", id).run();
+    await sql(env, "UPDATE boxes SET cut = 2 WHERE id = ?", id).run();
     const deleted = await cutTunnel(env, host, tunnelId);
-    return [200, { ok: true, deleted }, deleted ? [sql(env, "DELETE FROM boxes WHERE id = ?", id)] : []];
+    return [200, { ok: true, deleted }, [deleted ? sql(env, "DELETE FROM boxes WHERE id = ?", id) : sql(env, "UPDATE boxes SET cut = 1 WHERE id = ?", id)]];
   },
 
-  async "remove-box"(env, { id, tunnel_id: tunnelId, cf_id: cfId, offline, host }) {
+  // The tunnel is read again first: a box that connected since the hourly check is left alone.
+  async "remove-box"(env, { id, tunnel_id: tunnelId, cf_id: cfId, host }) {
     const box = await sql(env, "SELECT key_hash, net, tunnel_id FROM boxes WHERE id = ?", id).first();
     if (!box || box.tunnel_id !== tunnelId) return [200, { ok: true, note: "changed since" }];
-    if (cfId) await removeTunnel(env, host, cfId);
+    let offline = false;
+    if (cfId) {
+      const t = await getTunnel(env, cfId);
+      if (t) {
+        const s = stale(t, Date.now());
+        if (!s.neverConnected && !s.offline) return [200, { ok: true, note: "connected again" }];
+        offline = s.offline;
+      }
+      await removeTunnel(env, host, cfId);
+    }
     const writes = [sql(env, "DELETE FROM boxes WHERE id = ?", id)];
     if (offline) writes.push(sql(env, "INSERT OR REPLACE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", id, box.key_hash, box.net, Date.now()));
     return [200, { ok: true }, writes];
@@ -647,7 +730,9 @@ async function contributeApi(request, env) {
     return json({ error: "This box ID and key don't match. Update Printer Buddy to get a box ID." }, 403);
   }
   if (own.off) return json({ error: APP_OFF }, 403);
-  await sql(env, "UPDATE ids SET used = 1 WHERE id = ?", id).run();
+  // an ID the relay handed out that the daily cleanup deleted in between is refused before the upload
+  const marked = await sql(env, "UPDATE ids SET used = 1 WHERE id = ?", id).run();
+  if (own.r === 1 && !marked.meta.changes) return json({ error: "This box ID and key don't match. Update Printer Buddy to get a box ID." }, 403);
   if (RETIRED_LABELS.includes(label)) return json({ ok: true, note: `${label} photos are no longer collected` }, 201);
   if (!LABELS.includes(label)) return json({ error: `label must be one of: ${LABELS.join(", ")}` }, 400);
   if (!SOURCES.includes(source)) return json({ error: "Bad source" }, 400);
