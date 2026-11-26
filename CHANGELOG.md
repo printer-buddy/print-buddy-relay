@@ -2,6 +2,17 @@
 
 All changes to the printerbuddy.stream Worker, newest first.
 
+################################2026-11-26 sterling m security/stale-tunnels################################
+
+## A connected old box on a full network is cut, and a box never gets the token of a deleted tunnel
+
+When a box from before networks were stored asks from a network that's already full and its tunnel is still connected, the tunnel is cut (no routing, no address) instead of failing; the box is kept, uncounted, and gets the same tunnel and address back once there's room. Removing a tunnel (the box's own `DELETE`, or the refusal above) marks the box unfinished before it starts, and when a cut or unfinished box asks for its tunnel, the relay first checks the tunnel still exists: if it was already deleted, the box gets a new tunnel (through the usual network check) instead of the deleted tunnel's token. A box's own record no longer counts against its network or the total while it asks again. *Why:* deleting a connected tunnel fails, so the old box kept sharing without being counted; and if removal deleted the tunnel but failed on the address, a later request was answered 200 with a token that could never connect.
+
+Lines changed:
+- `worker.js` — 662–664 a cut or unfinished box whose tunnel is gone gets a new one, and its own record isn't counted; 669–676 the refusal marks the box unfinished and cuts a connected tunnel instead of failing; 690, 694, 700 a new tunnel replaces the old record, without a second Discord post; 712 `untunnel` marks the box unfinished before removing
+
+################################end of entry################################
+
 ################################2026-11-26 sterling m security/discord################################
 
 ## Discord commands: /register, /register-app, and admin approve and block; old boxes count toward their network

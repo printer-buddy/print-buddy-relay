@@ -659,16 +659,20 @@ const JOBS = {
     if (refused) return refused;
     if (own.off) return [403, { error: APP_OFF }];
     try {
-      const n = await sql(env, "SELECT COUNT(*) AS total, COALESCE(SUM(net = ?1), 0) AS here, EXISTS(SELECT 1 FROM allowed WHERE id = ?2) AS allowed FROM boxes", net, id).first();
+      // a cut or unfinished removal may have deleted the tunnel already: then the box gets a new tunnel, never the old token
+      const stale = !!box && !!box.cut && !(await getTunnel(env, box.tunnel_id));
+      const n = await sql(env, "SELECT COALESCE(SUM(id != ?2), 0) AS total, COALESCE(SUM(net = ?1 AND id != ?2), 0) AS here, EXISTS(SELECT 1 FROM allowed WHERE id = ?2) AS allowed FROM boxes", net, id).first();
       const limit = n.allowed ? Number(env.REGISTERED_PER_NETWORK || 5) : 1;
       const full = n.here < limit ? null
         : [429, { error: n.allowed ? `This network already has ${limit} boxes sharing.`
                                    : "This network already has a box sharing. Register this box with /register <box ID> in the Printer Buddy Discord to share up to 5 on one network." }];
-      if (box) {
+      if (box && !stale) {
         // a box from before networks were stored counts toward the network it asks from; if that network is full,
-        // its tunnel is removed and its ID held, so it gets the same address back once there's room
+        // its tunnel is removed and its ID held, or only cut (no routing, no address) while it's still connected,
+        // so it gets the same address back once there's room
         if (!box.net && full) {
-          await removeTunnel(env, host, box.tunnel_id);
+          await sql(env, "UPDATE boxes SET cut = 2 WHERE id = ?", id).run();
+          if (!(await cutTunnel(env, host, box.tunnel_id))) return [...full, [sql(env, "UPDATE boxes SET cut = 1 WHERE id = ?", id)]];
           return [...full, [sql(env, "DELETE FROM boxes WHERE id = ?", id),
                             sql(env, "INSERT OR REPLACE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", id, box.key_hash, net, Date.now())]];
         }
@@ -683,17 +687,17 @@ const JOBS = {
       const t = await makeTunnel(env, id, host, port);
       const now = Date.now();
       const writes = [
-        sql(env, "INSERT INTO boxes (id, tunnel_id, token, key_hash, port, net, cut, created, updated) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)", id, t.id, t.token, own.key_hash, port, net, now, now),
+        sql(env, "INSERT OR REPLACE INTO boxes (id, tunnel_id, token, key_hash, port, net, cut, created, updated) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)", id, t.id, t.token, own.key_hash, port, net, now, now),
         sql(env, "UPDATE ids SET used = 1 WHERE id = ?", id),
       ];
       if (held) writes.push(sql(env, "DELETE FROM held WHERE id = ?", id));
-      if (env.DISCORD_WEBHOOK && !held) {
+      if (env.DISCORD_WEBHOOK && !held && !stale) {
         await fetch(env.DISCORD_WEBHOOK, {
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ content: `Box ${id} set up wireless sharing!` }),
         }).catch(() => {});
       }
-      return [held ? 200 : 201, { token: t.token, hostname: host }, writes];
+      return [held || stale ? 200 : 201, { token: t.token, hostname: host }, writes];
     } catch (e) {
       return [502, { error: `Cloudflare said: ${e.message}` }];
     }
@@ -705,6 +709,7 @@ const JOBS = {
     const refused = keyRefused(await owner(env, id), box, held, keyHash);
     if (refused) return refused;
     if (!box) return [200, { ok: true, note: "nothing to remove" }, held && !hold ? [sql(env, "DELETE FROM held WHERE id = ?", id)] : []];
+    await sql(env, "UPDATE boxes SET cut = 2 WHERE id = ?", id).run();
     try {
       await removeTunnel(env, host, box.tunnel_id);
     } catch (e) {
