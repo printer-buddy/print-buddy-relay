@@ -27,11 +27,28 @@ routes = [
   { pattern = "www.printerbuddy.stream/*", zone_name = "printerbuddy.stream" },
 ]
 
-# storage for tunnels, photo limits and AI stats ("printer-buddy-boxes")
+# storage for photo limits and AI stats ("printer-buddy-boxes"); the first queue job copies its box records into D1
 kv_namespaces = [
   { binding = "BOXES", id = "bf28f11d28de4b8c983948066e4b038e" },
 ]
 
-# daily AI report to Discord at 13:00 UTC
+# box IDs, tunnels, the allow list and apps. With no database_id, the first deploy makes "printer-buddy"
+# (or uses it if it already exists) and later deploys keep it.
+[[d1_databases]]
+binding = "DB"
+database_name = "printer-buddy"
+
+# every change to box IDs, tunnels, the allow list and apps is a job here, run one at a time
+[[queues.producers]]
+binding = "JOBS"
+queue = "printer-buddy-jobs"
+
+[[queues.consumers]]
+queue = "printer-buddy-jobs"
+max_batch_size = 1
+max_batch_timeout = 0
+max_concurrency = 1
+
+# daily AI report to Discord and unused box ID cleanup at 13:00 UTC; tunnel cleanup every hour at :30
 [triggers]
-crons = ["0 13 * * *"]
+crons = ["0 13 * * *", "30 * * * *"]
