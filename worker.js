@@ -210,10 +210,12 @@ async function removeTunnel(env, host, tunnelId) {
 async function cutTunnel(env, host, tunnelId) {
   try {
     await removeTunnel(env, host, tunnelId);
+    return true;
   } catch {
     await cf(env, "PUT", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}/configurations`, { config: { ingress: [{ service: "http_status:404" }] } });
     const rec = await dnsRecord(env, host);
     if (rec) await cf(env, "DELETE", `/zones/${env.CF_ZONE_ID}/dns_records/${rec.id}`);
+    return false;
   }
 }
 
@@ -285,7 +287,10 @@ async function tunnelApi(request, env, ctx, url) {
       await env.BOXES.put(kvKey, JSON.stringify(box));
       if (wasCut && await appOff(env, own)) {
         await env.BOXES.put(kvKey, JSON.stringify({ ...box, cut: true }));
-        await cutTunnel(env, host, box.tunnel_id).catch(() => {});
+        if (await cutTunnel(env, host, box.tunnel_id).catch(() => false)) {
+          await env.BOXES.delete(kvKey);
+          await freeSlot(env, box);
+        }
         return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
       }
       return json({ token: box.token, hostname: host });
@@ -312,7 +317,7 @@ async function tunnelApi(request, env, ctx, url) {
         await env.BOXES.delete(kvKey);
       } catch {
         await env.BOXES.put(kvKey, JSON.stringify({ ...rec, cut: true }));
-        await cutTunnel(env, host, t.id).catch(() => {});
+        if (await cutTunnel(env, host, t.id).catch(() => false)) await env.BOXES.delete(kvKey);
       }
       return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
     }
