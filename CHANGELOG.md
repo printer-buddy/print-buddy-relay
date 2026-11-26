@@ -2,6 +2,17 @@
 
 All changes to the printerbuddy.stream Worker, newest first.
 
+################################2026-11-26 sterling m security/register-carry-over################################
+
+## Boxes registered before keep their 5, and asking for an ID again updates the box's network
+
+Once the KV records are copied, the first start after this deploy registers the network of every box that was registered one at a time before (from its tunnel or held ID); a registered box with neither has no stored network and needs `/register` again. A box that asks `/api/box` again with its own key now updates the network the relay last saw it on. *Why:* the limit only reads registered networks, so every box registered before lost its 5 until it was registered again; and asking again for an ID was answered without the network being recorded, so `/register` used an old one.
+
+Lines changed:
+- `worker.js` — 192–195 copy the registered boxes' networks once; 389–392 asking again for an ID records the network
+
+################################end of entry################################
+
 ################################2026-11-26 sterling m security/app-photos-only################################
 
 ## App box IDs only send photos

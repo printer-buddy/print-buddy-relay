@@ -189,6 +189,10 @@ const SCHEMA = [
   "CREATE INDEX IF NOT EXISTS ids_key ON ids (key_hash)",
   "CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, net TEXT, at INTEGER)",
   "CREATE TABLE IF NOT EXISTS allowed_nets (net TEXT PRIMARY KEY)",
+  // once, after the KV records are copied: boxes registered one at a time before register their network
+  "INSERT OR IGNORE INTO allowed_nets (net) SELECT n FROM (SELECT COALESCE((SELECT net FROM boxes WHERE id = a.id), (SELECT net FROM held WHERE id = a.id)) AS n FROM allowed a) " +
+    "WHERE n IS NOT NULL AND NOT EXISTS (SELECT 1 FROM meta WHERE k = 'nets_copied')",
+  "INSERT OR IGNORE INTO meta (k, v) SELECT 'nets_copied', '1' WHERE EXISTS (SELECT 1 FROM meta WHERE k = 'migrated' AND v = '1')",
 ];
 
 // the last network a box was seen on (only after its key matched), which /register registers
@@ -382,7 +386,10 @@ async function boxApi(request, env) {
   if (await ready(env)) {
     const pre = await sql(env, "SELECT COALESCE((SELECT n FROM box_days WHERE net = ?1 AND day = ?2), 0) AS today, EXISTS(SELECT 1 FROM ids WHERE id = ?3) AS taken, " +
                                "(SELECT id FROM ids WHERE key_hash = ?4) AS mine", net, data.day, data.id ?? null, data.own_hash ?? null).first();
-    if (pre.mine) return json({ id: pre.mine, key: b.key }, 201);
+    if (pre.mine) {
+      await seenAt(env, pre.mine, net).run();
+      return json({ id: pre.mine, key: b.key }, 201);
+    }
     if (pre.today >= Number(env.BOXES_PER_NETWORK_PER_DAY || 5)) return json({ error: "Too many new box IDs from this network today. Try again tomorrow." }, 429);
     if (data.id && pre.taken) return json({ error: "This Printer Buddy ID already belongs to a box." }, 409);
   }
