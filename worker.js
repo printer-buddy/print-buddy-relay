@@ -114,7 +114,7 @@ function offline(path) {
 // A box removes its tunnel:    DELETE /api/tunnel  {"id": "...", "key": "...", "hold": true|false}
 //   hold: true keeps its address for that box while it's not sharing; false gives it up (Remote access off).
 // Only the box holding the key can change, delete or get back its tunnel.
-// One box sharing at a time per network, 5 for boxes on the allow list (/api/register).
+// One box sharing at a time per network, 5 on a network registered with /api/register.
 
 const json = (data, status = 200) => new Response(JSON.stringify(data),
   { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
@@ -187,7 +187,19 @@ const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS results (job TEXT PRIMARY KEY, status INTEGER, body TEXT, created INTEGER)",
   "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
   "CREATE INDEX IF NOT EXISTS ids_key ON ids (key_hash)",
+  "CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, net TEXT, at INTEGER)",
+  "CREATE TABLE IF NOT EXISTS allowed_nets (net TEXT PRIMARY KEY)",
 ];
+
+// once, after the KV records are copied: boxes registered one at a time before register their network
+const COPY_NETS = [
+  "INSERT OR IGNORE INTO allowed_nets (net) SELECT n FROM (SELECT COALESCE((SELECT net FROM boxes WHERE id = a.id), (SELECT net FROM held WHERE id = a.id)) AS n FROM allowed a) " +
+    "WHERE n IS NOT NULL AND NOT EXISTS (SELECT 1 FROM meta WHERE k = 'nets_copied')",
+  "INSERT OR IGNORE INTO meta (k, v) SELECT 'nets_copied', '1' WHERE EXISTS (SELECT 1 FROM meta WHERE k = 'migrated' AND v = '1')",
+];
+
+// the last network a box was seen on (only after its key matched), which /register registers
+const seenAt = (env, id, net) => sql(env, "INSERT INTO seen (id, net, at) VALUES (?, ?, ?) ON CONFLICT (id) DO UPDATE SET net = excluded.net, at = excluded.at", id, net, Date.now());
 let schemaReady = false;
 
 const sql = (env, query, ...args) => env.DB.prepare(query).bind(...args);
@@ -195,7 +207,7 @@ const sql = (env, query, ...args) => env.DB.prepare(query).bind(...args);
 // true once the records from KV have been copied into D1
 async function ready(env) {
   if (!schemaReady) {
-    await env.DB.batch(SCHEMA.map(s => env.DB.prepare(s)));
+    await env.DB.batch([...SCHEMA, ...COPY_NETS].map(s => env.DB.prepare(s)));
     schemaReady = true;
   }
   return (await sql(env, "SELECT v FROM meta WHERE k = 'migrated'").first("v")) === "1";
@@ -348,11 +360,11 @@ async function tunnelApi(request, env, url) {
     if (!keyHash || keyHash !== own.key_hash) return json({ error: OTHER_BOX }, 403);
     if (request.method === "POST" && own.off) return json({ error: APP_OFF }, 403);
   }
-  if (request.method === "DELETE") return answer(await viaQueue(env, "untunnel", { id, key_hash: keyHash, hold: b.hold === true, host }));
+  const net = networkOf(request.headers.get("cf-connecting-ip") || "unknown");
+  if (request.method === "DELETE") return answer(await viaQueue(env, "untunnel", { id, key_hash: keyHash, hold: b.hold === true, host, net }));
 
   const port = Number(b.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return json({ error: "Bad port" }, 400);
-  const net = networkOf(request.headers.get("cf-connecting-ip") || "unknown");
   return answer(await viaQueue(env, "tunnel", { id, port, key_hash: keyHash, net, host }));
 }
 
@@ -377,7 +389,10 @@ async function boxApi(request, env) {
   if (await ready(env)) {
     const pre = await sql(env, "SELECT COALESCE((SELECT n FROM box_days WHERE net = ?1 AND day = ?2), 0) AS today, EXISTS(SELECT 1 FROM ids WHERE id = ?3) AS taken, " +
                                "(SELECT id FROM ids WHERE key_hash = ?4) AS mine", net, data.day, data.id ?? null, data.own_hash ?? null).first();
-    if (pre.mine) return json({ id: pre.mine, key: b.key }, 201);
+    if (pre.mine) {
+      await seenAt(env, pre.mine, net).run();
+      return json({ id: pre.mine, key: b.key }, 201);
+    }
     if (pre.today >= Number(env.BOXES_PER_NETWORK_PER_DAY || 5)) return json({ error: "Too many new box IDs from this network today. Try again tomorrow." }, 429);
     if (data.id && pre.taken) return json({ error: "This Printer Buddy ID already belongs to a box." }, 409);
   }
@@ -388,7 +403,7 @@ async function boxApi(request, env) {
   return json({ id: body.id, key: body.key === "given" ? b.key : key }, 201);
 }
 
-// The Discord bot puts a box on the allow list:  POST /api/register  {"id": "1234567"}  (authorization: Bearer <REGISTER_SECRET>)
+// The Discord bot registers a box's network:  POST /api/register  {"id": "1234567"}  (authorization: Bearer <REGISTER_SECRET>)
 async function registerApi(request, env) {
   if (!env.REGISTER_SECRET || !env.DB || !env.JOBS) return json({ error: "Registering isn't set up on this server yet." }, 503);
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
@@ -451,7 +466,7 @@ async function appApi(request, env, url) {
 
 // Discord sends its slash commands here (the app's Interactions Endpoint URL), signed with the app's Ed25519 key.
 // Discord wants an answer within 3 seconds, so the reply is "thinking…" first and the result is edited in afterwards.
-//   /register id:<box ID>           anyone: the box goes on the allow list
+//   /register id:<box ID>           anyone: the network that box was last seen on is registered
 //   /register-app name:<name>       anyone: asks for an app; once approved, the same user gets its box IDs and keys
 //   /approve-app name:, /block app:, /unblock app:   admins of the Printer Buddy server only
 const DISCORD = "https://discord.com/api/v10";
@@ -508,7 +523,7 @@ async function discordCommand(env, url, i) {
     if (!/^\d{6,10}$/.test(id)) return { content: "That isn't a box ID. It's the number under Box ID in the Printer Buddy menu." };
     if (checked && !(await owner(env, id))) return { content: "No box has that ID." };
     const [status, body] = await viaQueue(env, "register", { id });
-    return { content: status === 200 ? `Box ${id} is registered: up to ${Number(env.REGISTERED_PER_NETWORK || 5)} boxes on its network can share.` : body.error };
+    return { content: status === 200 ? `Box ${id} is registered: up to ${Number(env.REGISTERED_PER_NETWORK || 5)} can share on its network.` : body.error };
   }
 
   const name = (opt.name || opt.app || "").toLowerCase();
@@ -621,7 +636,7 @@ async function migrateStep(env) {
   const next = page.list_complete ? { p: at.p + 1 } : { p: at.p, c: page.cursor };
   const done = next.p >= MIGRATE.length;
   writes.push(sql(env, "INSERT OR REPLACE INTO meta (k, v) VALUES ('migrate', ?)", JSON.stringify(next)));
-  if (done) writes.push(sql(env, "INSERT OR REPLACE INTO meta (k, v) VALUES ('migrated', '1')"));
+  if (done) writes.push(sql(env, "INSERT OR REPLACE INTO meta (k, v) VALUES ('migrated', '1')"), ...COPY_NETS.map(q => sql(env, q)));
   await env.DB.batch(writes);
   return done;
 }
@@ -651,11 +666,13 @@ const JOBS = {
     const own = await owner(env, id);
     const refused = keyRefused(own, box, held, keyHash);
     if (refused) return refused;
+    await seenAt(env, id, net).run();
     if (own.off) return [403, { error: APP_OFF }];
+    if (own.app) return [403, { error: "App box IDs are for photos only." }];
     try {
       // a cut or unfinished removal may have deleted the tunnel already: then the box gets a new tunnel, never the old token
       const stale = !!box && !!box.cut && !(await getTunnel(env, box.tunnel_id));
-      const n = await sql(env, "SELECT COALESCE(SUM(id != ?2), 0) AS total, COALESCE(SUM(net = ?1 AND id != ?2), 0) AS here, EXISTS(SELECT 1 FROM allowed WHERE id = ?2) AS allowed FROM boxes", net, id).first();
+      const n = await sql(env, "SELECT COALESCE(SUM(id != ?2), 0) AS total, COALESCE(SUM(net = ?1 AND id != ?2), 0) AS here, EXISTS(SELECT 1 FROM allowed_nets WHERE net = ?1) AS allowed FROM boxes", net, id).first();
       const limit = n.allowed ? Number(env.REGISTERED_PER_NETWORK || 5) : 1;
       const full = n.here < limit ? null
         : [429, { error: n.allowed ? `This network already has ${limit} boxes sharing.`
@@ -697,11 +714,12 @@ const JOBS = {
     }
   },
 
-  async untunnel(env, { id, key_hash: keyHash, hold, host }) {
+  async untunnel(env, { id, key_hash: keyHash, hold, host, net }) {
     const box = await sql(env, "SELECT * FROM boxes WHERE id = ?", id).first();
     const held = box ? null : await sql(env, "SELECT * FROM held WHERE id = ?", id).first();
     const refused = keyRefused(await owner(env, id), box, held, keyHash);
     if (refused) return refused;
+    if (net) await seenAt(env, id, net).run();
     if (!box) return [200, { ok: true, note: "nothing to remove" }, held && !hold ? [sql(env, "DELETE FROM held WHERE id = ?", id)] : []];
     await sql(env, "UPDATE boxes SET cut = 2 WHERE id = ?", id).run();
     try {
@@ -720,7 +738,7 @@ const JOBS = {
   async box(env, { id: given, given_hash: givenHash, new_hash: newHash, own_hash: ownHash, net, day }) {
     if (ownHash) {
       const mine = await sql(env, "SELECT id FROM ids WHERE key_hash = ?", ownHash).first("id");
-      if (mine) return [201, { id: mine, key: "given" }];
+      if (mine) return [201, { id: mine, key: "given" }, [seenAt(env, mine, net)]];
     }
     const today = (await sql(env, "SELECT n FROM box_days WHERE net = ? AND day = ?", net, day).first("n")) || 0;
     if (today >= Number(env.BOXES_PER_NETWORK_PER_DAY || 5)) return [429, { error: "Too many new box IDs from this network today. Try again tomorrow." }];
@@ -737,12 +755,18 @@ const JOBS = {
     return [201, { id, key }, [
       sql(env, "INSERT INTO ids (id, key_hash, created, used) VALUES (?, ?, ?, ?)", id, hash, Date.now(), used),
       sql(env, "INSERT INTO box_days (net, day, n) VALUES (?, ?, 1) ON CONFLICT (net, day) DO UPDATE SET n = n + 1", net, day),
+      seenAt(env, id, net),
     ]];
   },
 
+  // registers the network the box was last seen on, so up to 5 boxes on that network can share
   async register(env, { id }) {
-    if (!(await owner(env, id))) return [404, { error: "No box has that ID." }];
-    return [200, { ok: true, id }, [sql(env, "INSERT OR IGNORE INTO allowed (id) VALUES (?)", id), sql(env, "UPDATE ids SET used = 1 WHERE id = ?", id)]];
+    const own = await owner(env, id);
+    if (!own) return [404, { error: "No box has that ID." }];
+    if (own.app) return [403, { error: "App box IDs are for photos only." }];
+    const net = await sql(env, "SELECT COALESCE((SELECT net FROM seen WHERE id = ?1), (SELECT net FROM boxes WHERE id = ?1), (SELECT net FROM held WHERE id = ?1)) AS net", id).first("net");
+    if (!net) return [409, { error: "The relay hasn't seen that box yet. Make a share link on it (or turn on Remote access), then register it." }];
+    return [200, { ok: true, id }, [sql(env, "INSERT OR IGNORE INTO allowed_nets (net) VALUES (?)", net), sql(env, "UPDATE ids SET used = 1 WHERE id = ?", id)]];
   },
 
   async app(env, { name, key_hash: keyHash }) {
@@ -886,6 +910,7 @@ async function contributeApi(request, env) {
   // an ID the relay handed out that the daily cleanup deleted in between is refused before the upload
   const marked = await sql(env, "UPDATE ids SET used = 1 WHERE id = ?", id).run();
   if (own.r === 1 && !marked.meta.changes) return json({ error: "This box ID and key don't match. Update Printer Buddy to get a box ID." }, 403);
+  await seenAt(env, id, networkOf(request.headers.get("cf-connecting-ip") || "unknown")).run();
   if (RETIRED_LABELS.includes(label)) return json({ ok: true, note: `${label} photos are no longer collected` }, 201);
   if (!LABELS.includes(label)) return json({ error: `label must be one of: ${LABELS.join(", ")}` }, 400);
   if (!SOURCES.includes(source)) return json({ error: "Bad source" }, 400);

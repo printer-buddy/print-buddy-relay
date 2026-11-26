@@ -2,6 +2,51 @@
 
 All changes to the printerbuddy.stream Worker, newest first.
 
+################################2026-11-26 sterling m security/register-carry-over-timing################################
+
+## Earlier registrations are copied as soon as the KV move finishes
+
+The copy of earlier registrations now also runs in the same step that finishes copying the KV records, not only when the relay starts. *Why:* a relay that started before the KV move was done ran the copy too early and didn't run it again, so earlier registrations stayed off until the next start.
+
+Lines changed:
+- `worker.js` — 192–198 the copy is its own list, `COPY_NETS`; 210 the start runs it after the tables; 639 the last KV step runs it
+
+################################end of entry################################
+
+################################2026-11-26 sterling m security/register-carry-over################################
+
+## Boxes registered before keep their 5, and asking for an ID again updates the box's network
+
+Once the KV records are copied, the first start after this deploy registers the network of every box that was registered one at a time before (from its tunnel or held ID); a registered box with neither has no stored network and needs `/register` again. A box that asks `/api/box` again with its own key now updates the network the relay last saw it on. *Why:* the limit only reads registered networks, so every box registered before lost its 5 until it was registered again; and asking again for an ID was answered without the network being recorded, so `/register` used an old one.
+
+Lines changed:
+- `worker.js` — 192–195 copy the registered boxes' networks once; 389–392 asking again for an ID records the network
+
+################################end of entry################################
+
+################################2026-11-26 sterling m security/app-photos-only################################
+
+## App box IDs only send photos
+
+An app's box ID now gets 403 "App box IDs are for photos only." when it asks for a tunnel or is sent to `/register`. *Why:* apps only send photos; before, an app's ID and key could get a tunnel like a box, and registering one opened its network to 5.
+
+Lines changed:
+- `worker.js` — 661 the tunnel job refuses an app's ID; 754–756 the `register` job refuses an app's ID
+
+################################end of entry################################
+
+################################2026-11-26 sterling m security/register-network################################
+
+## /register registers a network, not a single box
+
+`/register id:<box ID>` now registers the network the relay last saw that box on, and up to 5 boxes can share on a registered network; every other network stays at 1. The relay remembers a box's latest network only after its key matched: when it gets its ID, asks for or removes its tunnel, or sends a photo. A box the relay hasn't seen yet can't be registered and gets "The relay hasn't seen that box yet". *Why:* the limit is 1 tunnel per network unless the network is registered; registering put only that one box on the allow list.
+
+Lines changed:
+- `worker.js` — 117 comment; 190–195 the `seen` and `allowed_nets` tables and `seenAt`; 356–357 the box's network is sent with a tunnel removal; 396, 459 comments; 516 the `/register` reply; 659 the tunnel job remembers the network; 664 the limit checks `allowed_nets`; 706, 711 a tunnel removal remembers the network; 730, 747 getting an ID remembers the network; 751–756 the `register` job registers the box's last network, or answers 409; 900 a photo remembers the network
+- `README.md` — 15 the limit; 68, 77 `REGISTER_SECRET` and the register call; 96 what `/register` does
+
+################################end of entry################################
+
 ################################2026-11-26 sterling m security/app-request-notice################################
 
 ## Admins hear about an app request even if the /register-app command timed out
