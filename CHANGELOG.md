@@ -2,6 +2,17 @@
 
 All changes to the printerbuddy.stream Worker, newest first.
 
+################################2026-11-26 sterling m security/app-request-notice################################
+
+## Admins hear about an app request even if the /register-app command timed out
+
+The post to `DISCORD_ADMIN_WEBHOOK` about a new app request is now sent by the queue job that saves the request, instead of by the Discord command after the job answers. *Why:* if the queue answered after the command's 20 seconds, the request was saved but the admins were never told, and asking again only said "still waiting".
+
+Lines changed:
+- `worker.js` — 525 the `/register-app` command no longer posts to the admins; 766–776 the `app-request` job posts to the admins when it saves a new request
+
+################################end of entry################################
+
 ################################2026-11-26 sterling m security/stale-tunnels################################
 
 ## A connected old box on a full network is cut, and a box never gets the token of a deleted tunnel

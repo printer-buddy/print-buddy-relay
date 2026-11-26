@@ -523,12 +523,6 @@ async function discordCommand(env, url, i) {
     const waiting = `Your request for **${name}** is waiting for a Printer Buddy admin. Run /register-app name:${name} again once it's approved to get its box IDs.`;
     if (app) return { content: waiting };
     const [status, body] = await viaQueue(env, "app-request", { name, user });
-    if (status === 201 && env.DISCORD_ADMIN_WEBHOOK) {
-      await fetch(env.DISCORD_ADMIN_WEBHOOK, {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ content: `App **${name}** requested by <@${user}>. Approve with /approve-app name:${name}`, allowed_mentions: { parse: [] } }),
-      }).catch(() => {});
-    }
     if (status === 200 && !body.pending) return appPairs(env, name);
     return { content: status === 200 || status === 201 ? waiting : body.error };
   }
@@ -769,10 +763,17 @@ const JOBS = {
     return [201, { ids }, writes];
   },
 
-  // /register-app in Discord: the first ask saves a request; the same Discord user asking again sees where it stands
+  // /register-app in Discord: the first ask saves a request and tells the admins, even if the person's command timed out;
+  // the same Discord user asking again sees where it stands
   async "app-request"(env, { name, user }) {
     const app = await sql(env, "SELECT pending, requested_by FROM apps WHERE name = ?", name).first();
     if (app) return app.requested_by === user ? [200, { name, pending: !!app.pending }] : [409, { error: "That app name is taken." }];
+    if (env.DISCORD_ADMIN_WEBHOOK) {
+      await fetch(env.DISCORD_ADMIN_WEBHOOK, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: `App **${name}** requested by <@${user}>. Approve with /approve-app name:${name}`, allowed_mentions: { parse: [] } }),
+      }).catch(() => {});
+    }
     return [201, { name, pending: true }, [sql(env, "INSERT INTO apps (name, key_hash, created, ids, off, pending, requested_by) VALUES (?, NULL, ?, 0, 0, 1, ?)", name, Date.now(), user)]];
   },
 
