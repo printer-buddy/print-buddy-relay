@@ -591,6 +591,7 @@ const JOBS = {
     }
     const writes = [sql(env, "DELETE FROM boxes WHERE id = ?", id)];
     if (hold) writes.push(sql(env, "INSERT OR REPLACE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", id, box.key_hash, box.net, Date.now()));
+    else writes.push(sql(env, "DELETE FROM held WHERE id = ?", id));
     return [200, { ok: true }, writes];
   },
 
