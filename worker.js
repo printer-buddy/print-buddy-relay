@@ -658,6 +658,7 @@ const JOBS = {
     if (refused) return refused;
     await seenAt(env, id, net).run();
     if (own.off) return [403, { error: APP_OFF }];
+    if (own.app) return [403, { error: "App box IDs are for photos only." }];
     try {
       // a cut or unfinished removal may have deleted the tunnel already: then the box gets a new tunnel, never the old token
       const stale = !!box && !!box.cut && !(await getTunnel(env, box.tunnel_id));
@@ -750,7 +751,9 @@ const JOBS = {
 
   // registers the network the box was last seen on, so up to 5 boxes on that network can share
   async register(env, { id }) {
-    if (!(await owner(env, id))) return [404, { error: "No box has that ID." }];
+    const own = await owner(env, id);
+    if (!own) return [404, { error: "No box has that ID." }];
+    if (own.app) return [403, { error: "App box IDs are for photos only." }];
     const net = await sql(env, "SELECT COALESCE((SELECT net FROM seen WHERE id = ?1), (SELECT net FROM boxes WHERE id = ?1), (SELECT net FROM held WHERE id = ?1)) AS net", id).first("net");
     if (!net) return [409, { error: "The relay hasn't seen that box yet. Make a share link on it (or turn on Remote access), then register it." }];
     return [200, { ok: true, id }, [sql(env, "INSERT OR IGNORE INTO allowed_nets (net) VALUES (?)", net), sql(env, "UPDATE ids SET used = 1 WHERE id = ?", id)]];

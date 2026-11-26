@@ -2,6 +2,17 @@
 
 All changes to the printerbuddy.stream Worker, newest first.
 
+################################2026-11-26 sterling m security/app-photos-only################################
+
+## App box IDs only send photos
+
+An app's box ID now gets 403 "App box IDs are for photos only." when it asks for a tunnel or is sent to `/register`. *Why:* apps only send photos; before, an app's ID and key could get a tunnel like a box, and registering one opened its network to 5.
+
+Lines changed:
+- `worker.js` — 661 the tunnel job refuses an app's ID; 754–756 the `register` job refuses an app's ID
+
+################################end of entry################################
+
 ################################2026-11-26 sterling m security/register-network################################
 
 ## /register registers a network, not a single box
