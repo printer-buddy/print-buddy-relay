@@ -13,6 +13,8 @@
 Only the box with the ID's key (kept in `printer-buddy.env` as `PB_BOX_KEY`) can set up, change, remove or get back its tunnel.
 Limits: 5 new box IDs per network per day, one tunnel per ID, one box sharing at a time per network (IPv6 counts per /64),
 5 for boxes on the allow list (`/register <box ID>` in the Discord), 500 in total. Removing a tunnel gives its slot back.
+A box that was sharing before networks were counted counts toward the network it next asks from; if that network is
+already full, its tunnel is removed and its ID held until there's room or it's registered.
 Every hour the Worker removes tunnels that never connected within an hour, and tunnels offline for 4 days (that box gets the
 same address back next time). Every day it deletes box IDs that were never used 30 days after they were handed out.
 Other programs that use the relay register as an app and get 50 box IDs; each ID remembers its app, and turning an app off
@@ -64,6 +66,9 @@ Open the `printer-buddy-share` Worker (see the top of `worker.js` if it doesn't 
 | Variables and Secrets (type **Text**) | `CF_ZONE_ID` | from step 2 |
 | Variables and Secrets (type **Text**) | `SHARE_DOMAIN` | `printerbuddy.stream` |
 | Variables and Secrets (type **Secret**) | `REGISTER_SECRET` | any long random text; the Discord bot sends it to put a box on the allow list |
+| Variables and Secrets (type **Text**) | `DISCORD_PUBLIC_KEY` | the Discord app's public key (see Discord commands below) |
+| Variables and Secrets (type **Text**) | `DISCORD_GUILD_ID` | the Printer Buddy Discord server's ID; admin commands only work there |
+| Variables and Secrets (type **Secret**) | `DISCORD_ADMIN_WEBHOOK` | webhook URL for an admin-only channel; app requests are posted there |
 | optional (Text) | `MAX_TUNNELS` | default `500` |
 | optional (Text) | `REGISTERED_PER_NETWORK` | default `5` |
 | optional (Text) | `BOXES_PER_NETWORK_PER_DAY` | default `5` |
@@ -80,6 +85,50 @@ Apps (all `POST` with `content-type: application/json`):
 | `/api/app/ids` | `{"name", "key"}` | the app's key | `{"ids": [{"id", "key"}, ...]}`, its 50 box IDs; asking again gives the same IDs and keys |
 | `/api/app/off` | `{"name"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"ok": true, "name", "off": true, "boxes"}`; then each of those boxes' tunnels is removed (cut if still connected) in its own job |
 | `/api/app/on` | `{"name"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"ok": true, "name", "off": false}` |
+
+### Discord commands
+
+The Worker answers Discord's slash commands itself at `https://www.printerbuddy.stream/api/discord`; no bot program runs anywhere.
+Replies are only shown to the person who typed the command.
+
+| Command | Who | What it does |
+|---|---|---|
+| `/register id:<box ID>` | anyone | puts the box on the allow list: up to 5 boxes on its network can share |
+| `/register-app name:<name>` | anyone | asks for an app; admins are told in `DISCORD_ADMIN_WEBHOOK`. Once approved, the same person running it again gets `<name>-ids.csv` (its 50 box IDs and keys) and the app key |
+| `/approve-app name:<name>` | admins | approves the app and makes its 50 box IDs |
+| `/block app:<name>`, `/unblock app:<name>` | admins | turns the app off (its tunnels and photos are refused, running tunnels cut) or back on |
+
+Admin commands are hidden from everyone without Administrator, and the Worker also checks that the person has
+Administrator in the server set in `DISCORD_GUILD_ID`.
+
+Set up once:
+
+1. **Discord Developer Portal > New Application.** From **General Information** copy the **Application ID** and **Public Key**;
+   put the Public Key in the Worker as `DISCORD_PUBLIC_KEY` (step 5) and deploy.
+2. In **General Information**, set **Interactions Endpoint URL** to `https://www.printerbuddy.stream/api/discord` and save
+   (Discord checks it right away, so the Worker has to be deployed first).
+3. **Bot > Reset Token** and copy the bot token, then create the commands:
+
+```bash
+curl -s -X PUT "https://discord.com/api/v10/applications/<application ID>/commands" \
+  -H "authorization: Bot <bot token>" -H "content-type: application/json" -d '[
+  {"name": "register", "description": "Let this box share with up to 5 boxes on its network", "contexts": [0],
+   "options": [{"type": 3, "name": "id", "description": "Box ID from the Printer Buddy menu", "required": true}]},
+  {"name": "register-app", "description": "Ask for an app and get its 50 box IDs once approved", "contexts": [0],
+   "options": [{"type": 3, "name": "name", "description": "App name", "required": true}]},
+  {"name": "approve-app", "description": "Approve an app", "contexts": [0], "default_member_permissions": "0",
+   "options": [{"type": 3, "name": "name", "description": "App name", "required": true}]},
+  {"name": "block", "description": "Turn an app off", "contexts": [0], "default_member_permissions": "0",
+   "options": [{"type": 3, "name": "app", "description": "App name", "required": true}]},
+  {"name": "unblock", "description": "Turn an app back on", "contexts": [0], "default_member_permissions": "0",
+   "options": [{"type": 3, "name": "app", "description": "App name", "required": true}]}
+]'
+```
+
+4. **Installation > Default Install Settings > Guild Install**: add the `applications.commands` and `bot` scopes (no bot
+   permissions are needed), then open the **Install Link** and add the app to the Printer Buddy server.
+5. Put the server's ID in `DISCORD_GUILD_ID` (Discord: User Settings > Advanced > Developer Mode on, then right-click the
+   server and copy its ID), and a webhook for an admin-only channel in `DISCORD_ADMIN_WEBHOOK`.
 
 The route `www.printerbuddy.stream/*` must point at this Worker (it already does if share links work).
 

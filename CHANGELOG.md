@@ -2,6 +2,40 @@
 
 All changes to the printerbuddy.stream Worker, newest first.
 
+################################2026-11-26 sterling m security/app-request-notice################################
+
+## Admins hear about an app request even if the /register-app command timed out
+
+The post to `DISCORD_ADMIN_WEBHOOK` about a new app request is now sent by the queue job that saves the request, instead of by the Discord command after the job answers. *Why:* if the queue answered after the command's 20 seconds, the request was saved but the admins were never told, and asking again only said "still waiting".
+
+Lines changed:
+- `worker.js` — 525 the `/register-app` command no longer posts to the admins; 766–776 the `app-request` job posts to the admins when it saves a new request
+
+################################end of entry################################
+
+################################2026-11-26 sterling m security/stale-tunnels################################
+
+## A connected old box on a full network is cut, and a box never gets the token of a deleted tunnel
+
+When a box from before networks were stored asks from a network that's already full and its tunnel is still connected, the tunnel is cut (no routing, no address) instead of failing; the box is kept, uncounted, and gets the same tunnel and address back once there's room. Removing a tunnel (the box's own `DELETE`, or the refusal above) marks the box unfinished before it starts, and when a cut or unfinished box asks for its tunnel, the relay first checks the tunnel still exists: if it was already deleted, the box gets a new tunnel (through the usual network check) instead of the deleted tunnel's token. A box's own record no longer counts against its network or the total while it asks again. *Why:* deleting a connected tunnel fails, so the old box kept sharing without being counted; and if removal deleted the tunnel but failed on the address, a later request was answered 200 with a token that could never connect.
+
+Lines changed:
+- `worker.js` — 662–664 a cut or unfinished box whose tunnel is gone gets a new one, and its own record isn't counted; 669–676 the refusal marks the box unfinished and cuts a connected tunnel instead of failing; 690, 694, 700 a new tunnel replaces the old record, without a second Discord post; 712 `untunnel` marks the box unfinished before removing
+
+################################end of entry################################
+
+################################2026-11-26 sterling m security/discord################################
+
+## Discord commands: /register, /register-app, and admin approve and block; old boxes count toward their network
+
+The Worker answers Discord's slash commands itself at `/api/discord` (the Discord app's Interactions Endpoint URL), so no bot program has to run anywhere; every request is checked against the app's Ed25519 public key (`DISCORD_PUBLIC_KEY`) and a bad signature gets 401. Discord wants an answer within 3 seconds, so the reply is "thinking…" first and the result is edited in afterwards, shown only to the person who typed the command. `/register id:<box ID>` (anyone) puts the box on the allow list. `/register-app name:<name>` (anyone) asks for an app and posts the request to `DISCORD_ADMIN_WEBHOOK`; once an admin approves it with `/approve-app name:<name>`, which makes the app and its 50 box IDs, the same person running `/register-app` again gets `<name>-ids.csv` with the 50 IDs and keys, plus the app key; anyone else is told the name is taken. `/block app:` and `/unblock app:` turn an app off and on. Admin commands are hidden from everyone without Administrator, and the Worker also checks that the person has Administrator in the server set in `DISCORD_GUILD_ID`. A box that was sharing before networks were stored now counts toward the network it next asks from; if that network is already full, its tunnel is removed and its ID held until there's room or it's registered. *Why:* the Printer Buddy UI and the relay's errors already told people to use `/register` in the Discord, but there was no command; apps had no way to ask for their box IDs; and boxes from before had no network, so they never counted toward the one-box limit.
+
+Lines changed:
+- `worker.js` — 37 route `/api/discord`; 185 apps remember a waiting request and who asked; 452–566 `discordApi`, `discordSigned`, `discordReply`, `isAdmin`, `discordCommand` and `appPairs`; 662–680 the tunnel job counts the networks first, refuses an old box on a full network (tunnel removed, ID held) and stores its network otherwise; 767–785 add the `app-request` and `app-approve` jobs
+- `README.md` — 16–17 old boxes and the network limit; 69–71 `DISCORD_PUBLIC_KEY`, `DISCORD_GUILD_ID`, `DISCORD_ADMIN_WEBHOOK`; 89–132 the Discord commands and how to set them up
+
+################################end of entry################################
+
 ################################2026-11-25 sterling m security/dns-held################################
 
 ## Removing a tunnel only takes its own address; an offline box keeps its ID when a removal is retried
