@@ -2,6 +2,17 @@
 
 All changes to the printerbuddy.stream Worker, newest first.
 
+################################2026-11-26 sterling m security/register-carry-over-timing################################
+
+## Earlier registrations are copied as soon as the KV move finishes
+
+The copy of earlier registrations now also runs in the same step that finishes copying the KV records, not only when the relay starts. *Why:* a relay that started before the KV move was done ran the copy too early and didn't run it again, so earlier registrations stayed off until the next start.
+
+Lines changed:
+- `worker.js` — 192–198 the copy is its own list, `COPY_NETS`; 210 the start runs it after the tables; 639 the last KV step runs it
+
+################################end of entry################################
+
 ################################2026-11-26 sterling m security/register-carry-over################################
 
 ## Boxes registered before keep their 5, and asking for an ID again updates the box's network

@@ -189,7 +189,10 @@ const SCHEMA = [
   "CREATE INDEX IF NOT EXISTS ids_key ON ids (key_hash)",
   "CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, net TEXT, at INTEGER)",
   "CREATE TABLE IF NOT EXISTS allowed_nets (net TEXT PRIMARY KEY)",
-  // once, after the KV records are copied: boxes registered one at a time before register their network
+];
+
+// once, after the KV records are copied: boxes registered one at a time before register their network
+const COPY_NETS = [
   "INSERT OR IGNORE INTO allowed_nets (net) SELECT n FROM (SELECT COALESCE((SELECT net FROM boxes WHERE id = a.id), (SELECT net FROM held WHERE id = a.id)) AS n FROM allowed a) " +
     "WHERE n IS NOT NULL AND NOT EXISTS (SELECT 1 FROM meta WHERE k = 'nets_copied')",
   "INSERT OR IGNORE INTO meta (k, v) SELECT 'nets_copied', '1' WHERE EXISTS (SELECT 1 FROM meta WHERE k = 'migrated' AND v = '1')",
@@ -204,7 +207,7 @@ const sql = (env, query, ...args) => env.DB.prepare(query).bind(...args);
 // true once the records from KV have been copied into D1
 async function ready(env) {
   if (!schemaReady) {
-    await env.DB.batch(SCHEMA.map(s => env.DB.prepare(s)));
+    await env.DB.batch([...SCHEMA, ...COPY_NETS].map(s => env.DB.prepare(s)));
     schemaReady = true;
   }
   return (await sql(env, "SELECT v FROM meta WHERE k = 'migrated'").first("v")) === "1";
@@ -633,7 +636,7 @@ async function migrateStep(env) {
   const next = page.list_complete ? { p: at.p + 1 } : { p: at.p, c: page.cursor };
   const done = next.p >= MIGRATE.length;
   writes.push(sql(env, "INSERT OR REPLACE INTO meta (k, v) VALUES ('migrate', ?)", JSON.stringify(next)));
-  if (done) writes.push(sql(env, "INSERT OR REPLACE INTO meta (k, v) VALUES ('migrated', '1')"));
+  if (done) writes.push(sql(env, "INSERT OR REPLACE INTO meta (k, v) VALUES ('migrated', '1')"), ...COPY_NETS.map(q => sql(env, q)));
   await env.DB.batch(writes);
   return done;
 }
