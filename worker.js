@@ -31,7 +31,7 @@ function newsApi() {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname === "/api/tunnel") return tunnelApi(request, env, ctx, url);
+    if (url.pathname === "/api/tunnel") return tunnelApi(request, env, url);
     if (url.pathname === "/api/box") return boxApi(request, env);
     if (url.pathname === "/api/register") return registerApi(request, env);
     if (["/api/app", "/api/app/ids", "/api/app/off", "/api/app/on"].includes(url.pathname)) return appApi(request, env, url);
@@ -79,8 +79,20 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(event.cron === "0 13 * * *" ? Promise.all([dailySummary(env), cleanupIds(env)])
+    ctx.waitUntil(event.cron === "0 13 * * *" ? Promise.all([dailySummary(env), env.JOBS ? queueJob(env, "cleanup-ids", {}) : null])
                                               : cleanupTunnels(env, new URL("https://" + (env.SHARE_DOMAIN || "printerbuddy.stream"))));
+  },
+
+  async queue(batch, env) {
+    for (const m of batch.messages) {
+      try {
+        await runJob(env, m.body);
+        m.ack();
+      } catch (e) {
+        console.log(`job ${m.body && m.body.type} failed: ${e.message}`);
+        m.retry();
+      }
+    }
   },
 };
 
@@ -162,44 +174,54 @@ function networkOf(ip) {
   return full.slice(0, 4).map(x => (parseInt(x, 16) || 0).toString(16)).join(":") + "::/64";
 }
 
-async function netGet(env, net) {
-  return (await env.BOXES.get(`net:${net}`, "json")) || { n: 0 };
+// Box IDs, tunnels, the allow list and apps live in D1. Every change to them is a job on the JOBS queue, which runs one
+// job at a time (max_concurrency = 1), so two changes can never overlap. A request waits for its job's answer in results.
+const SCHEMA = [
+  "CREATE TABLE IF NOT EXISTS ids (id TEXT PRIMARY KEY, key_hash TEXT, created INTEGER, used INTEGER DEFAULT 0, app TEXT)",
+  "CREATE TABLE IF NOT EXISTS boxes (id TEXT PRIMARY KEY, tunnel_id TEXT, token TEXT, key_hash TEXT, port INTEGER, net TEXT, cut INTEGER DEFAULT 0, created INTEGER, updated INTEGER)",
+  "CREATE TABLE IF NOT EXISTS held (id TEXT PRIMARY KEY, key_hash TEXT, net TEXT, held INTEGER)",
+  "CREATE TABLE IF NOT EXISTS allowed (id TEXT PRIMARY KEY)",
+  "CREATE TABLE IF NOT EXISTS apps (name TEXT PRIMARY KEY, key_hash TEXT, created INTEGER, ids INTEGER DEFAULT 0, off INTEGER DEFAULT 0)",
+  "CREATE TABLE IF NOT EXISTS box_days (net TEXT, day TEXT, n INTEGER, PRIMARY KEY (net, day))",
+  "CREATE TABLE IF NOT EXISTS results (job TEXT PRIMARY KEY, status INTEGER, body TEXT, created INTEGER)",
+  "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
+];
+let schemaReady = false;
+
+const sql = (env, query, ...args) => env.DB.prepare(query).bind(...args);
+
+// true once the records from KV have been copied into D1
+async function ready(env) {
+  if (!schemaReady) {
+    await env.DB.batch(SCHEMA.map(s => env.DB.prepare(s)));
+    schemaReady = true;
+  }
+  return (await sql(env, "SELECT v FROM meta WHERE k = 'migrated'").first("v")) === "1";
 }
 
-// id:<id> = an ID the relay handed out, with its key. Boxes set up before that are known by their tunnel record.
-async function owner(env, id) {
-  return (await env.BOXES.get(`id:${id}`, "json")) || (await env.BOXES.get(`box:${id}`, "json"))
-      || (await env.BOXES.get(`held:${id}`, "json"));
-}
+const NOT_HANDED_OUT = "This Printer Buddy ID wasn't handed out by the relay. Update Printer Buddy to get a box ID.";
+const OTHER_BOX = "This Printer Buddy ID is already set up on another box (or this box lost its key). " +
+                  "Remove PB_USER_ID, PB_BOX_KEY and PB_TUNNEL_KEY from printer-buddy.env to get a new ID.";
+const APP_OFF = "The app this box ID came from has been turned off by Printer Buddy.";
 
-async function appOff(env, own) {
-  return !!own.app && !!(await env.BOXES.get(`appoff:${own.app}`));
-}
+// ids = an ID the relay handed out, with its key. Boxes set up before that are known by their tunnel record.
+const OWNER = `SELECT w.key_hash, w.app, COALESCE((SELECT off FROM apps WHERE name = w.app), 0) AS off FROM (
+  SELECT 1 AS r, key_hash, app FROM ids WHERE id = ?1
+  UNION ALL SELECT 2, key_hash, NULL FROM boxes WHERE id = ?1
+  UNION ALL SELECT 3, key_hash, NULL FROM held WHERE id = ?1) AS w ORDER BY w.r LIMIT 1`;
+const owner = (env, id) => sql(env, OWNER, id).first();
 
-async function freeId(env) {
-  for (let i = 0; i < 10; i++) {
+async function freeIds(env, n) {
+  const pick = new Set();
+  while (pick.size < n + 10) {
     const r = new Uint32Array(1);
     crypto.getRandomValues(r);
-    const c = String(1000000 + r[0] % 9000000);
-    if (!(await owner(env, c))) return c;
+    pick.add(String(1000000 + r[0] % 9000000));
   }
-  return null;
-}
-
-async function markUsed(env, id) {
-  const rec = await env.BOXES.get(`id:${id}`, "json");
-  if (rec && !rec.used) await env.BOXES.put(`id:${id}`, JSON.stringify({ ...rec, used: true }), { metadata: { created: rec.created, used: true } });
-}
-
-async function freeSlot(env, box) {
-  if (box.noslot) return;
-  if (box.net) {
-    const n = await netGet(env, box.net);
-    n.n = Math.max(0, n.n - 1);
-    await env.BOXES.put(`net:${box.net}`, JSON.stringify(n));
-  }
-  const total = Number(await env.BOXES.get("count") || 0);
-  await env.BOXES.put("count", String(Math.max(0, total - 1)));
+  const taken = await sql(env, "SELECT value FROM json_each(?1) WHERE value IN (SELECT id FROM ids UNION SELECT id FROM boxes UNION SELECT id FROM held)",
+                          JSON.stringify([...pick])).all();
+  const no = new Set(taken.results.map(r => r.value));
+  return [...pick].filter(c => !no.has(c)).slice(0, n);
 }
 
 async function removeTunnel(env, host, tunnelId) {
@@ -232,8 +254,28 @@ async function makeTunnel(env, id, host, port) {
   return t;
 }
 
-async function tunnelApi(request, env, ctx, url) {
-  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.CF_ZONE_ID || !env.BOXES) {
+const queueJob = (env, type, data) => env.JOBS.send({ job: crypto.randomUUID(), type, data });
+
+async function sendJobs(env, jobs) {
+  for (let i = 0; i < jobs.length; i += 100) {
+    await env.JOBS.sendBatch(jobs.slice(i, i + 100).map(j => ({ body: { job: crypto.randomUUID(), ...j } })));
+  }
+}
+
+// D1 allows 50 queries per request on Workers Free, so this checks for the answer at most 40 times (20 s).
+async function viaQueue(env, type, data) {
+  const job = crypto.randomUUID();
+  await env.JOBS.send({ job, type, data });
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    const r = await sql(env, "SELECT status, body FROM results WHERE job = ?", job).first();
+    if (r) return [r.status, JSON.parse(r.body)];
+  }
+  return [503, { error: "The Printer Buddy server is busy. Try again in a minute." }];
+}
+
+async function tunnelApi(request, env, url) {
+  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.CF_ZONE_ID || !env.DB || !env.JOBS) {
     return json({ error: "Automatic setup isn't configured on this server yet." }, 503);
   }
   if (request.method !== "POST" && request.method !== "DELETE") return json({ error: "Method not allowed" }, 405);
@@ -243,154 +285,60 @@ async function tunnelApi(request, env, ctx, url) {
   if (!/^\d{6,10}$/.test(id)) return json({ error: "Bad Printer Buddy ID" }, 400);
   const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
   const host = `u${id}.${domain}`;
-  const kvKey = `box:${id}`, heldKey = `held:${id}`;
-  const box = await env.BOXES.get(kvKey, "json");
-  const held = box ? null : await env.BOXES.get(heldKey, "json");
   const keyHash = typeof b.key === "string" ? await sha256(b.key) : null;
-  const own = (await env.BOXES.get(`id:${id}`, "json")) || box || held;
 
-  if (!own) return json({ error: "This Printer Buddy ID wasn't handed out by the relay. Update Printer Buddy to get a box ID." }, 403);
-  if ((box && keyHash !== box.key_hash) || (held && keyHash !== held.key_hash) || keyHash !== own.key_hash) {
-    return json({ error: "This Printer Buddy ID is already set up on another box (or this box lost its key). " +
-                        "Remove PB_USER_ID, PB_BOX_KEY and PB_TUNNEL_KEY from printer-buddy.env to get a new ID." }, 403);
+  if (await ready(env)) {
+    const own = await owner(env, id);
+    if (!own) return json({ error: NOT_HANDED_OUT }, 403);
+    if (!keyHash || keyHash !== own.key_hash) return json({ error: OTHER_BOX }, 403);
+    if (request.method === "POST" && own.off) return json({ error: APP_OFF }, 403);
   }
+  if (request.method === "DELETE") return answer(await viaQueue(env, "untunnel", { id, key_hash: keyHash, hold: b.hold === true, host }));
 
-  try {
-    if (request.method === "DELETE") {
-      if (!box) {
-        if (held && b.hold !== true) await env.BOXES.delete(heldKey);
-        return json({ ok: true, note: "nothing to remove" });
-      }
-      try {
-        await removeTunnel(env, host, box.tunnel_id);
-      } catch (e) {
-        return json({ error: `The tunnel is still connected. Stop cloudflared on the box and try again in a minute. (${e.message})` }, 409);
-      }
-      await env.BOXES.delete(kvKey);
-      if (b.hold === true) await env.BOXES.put(heldKey, JSON.stringify({ key_hash: box.key_hash, net: box.net || null, held: Date.now() }));
-      await freeSlot(env, box);
-      return json({ ok: true });
-    }
-
-    if (await appOff(env, own)) return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
-    const port = Number(b.port);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) return json({ error: "Bad port" }, 400);
-
-    if (box) {
-      const wasCut = !!box.cut;
-      if (box.port !== port || box.cut) {
-        await routing(env, box.tunnel_id, host, port);
-        if (box.cut) await pointDns(env, host, box.tunnel_id);
-        box.port = port;
-        delete box.cut;
-      }
-      box.updated = Date.now();
-      await env.BOXES.put(kvKey, JSON.stringify(box));
-      if (wasCut && await appOff(env, own)) {
-        await env.BOXES.put(kvKey, JSON.stringify({ ...box, cut: true }));
-        if (await cutTunnel(env, host, box.tunnel_id).catch(() => false)) {
-          await env.BOXES.delete(kvKey);
-          await freeSlot(env, box);
-        }
-        return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
-      }
-      if (box.noslot) {
-        const total = Number(await env.BOXES.get("count") || 0), boxNet = await netGet(env, box.net);
-        await env.BOXES.put(`net:${box.net}`, JSON.stringify({ n: boxNet.n + 1 }));
-        await env.BOXES.put("count", String(total + 1));
-        delete box.noslot;
-        await env.BOXES.put(kvKey, JSON.stringify(box));
-      }
-      return json({ token: box.token, hostname: host });
-    }
-
-    const total = Number(await env.BOXES.get("count") || 0);
-    if (total >= Number(env.MAX_TUNNELS || 500)) return json({ error: "Wireless sharing is full right now. Please tell the Printer Buddy team." }, 503);
-
-    const net = networkOf(request.headers.get("cf-connecting-ip") || "unknown");
-    const netInfo = await netGet(env, net);
-    const allowed = !!(await env.BOXES.get(`allowed:${id}`));
-    const limit = allowed ? Number(env.REGISTERED_PER_NETWORK || 5) : 1;
-    if (netInfo.n >= limit) {
-      return json({ error: allowed ? `This network already has ${limit} boxes sharing.`
-                                   : "This network already has a box sharing. Register this box with /register <box ID> in the Printer Buddy Discord to share up to 5 on one network." }, 429);
-    }
-
-    const t = await makeTunnel(env, id, host, port);
-    const rec = { tunnel_id: t.id, token: t.token, key_hash: own.key_hash, port, net, created: Date.now(), updated: Date.now() };
-    await env.BOXES.put(kvKey, JSON.stringify(rec));
-    if (await appOff(env, own)) {
-      try {
-        await removeTunnel(env, host, t.id);
-        await env.BOXES.delete(kvKey);
-      } catch {
-        await env.BOXES.put(kvKey, JSON.stringify({ ...rec, cut: true, noslot: true }));
-        if (await cutTunnel(env, host, t.id).catch(() => false)) await env.BOXES.delete(kvKey);
-      }
-      return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
-    }
-    if (held) await env.BOXES.delete(heldKey);
-    await env.BOXES.put(`net:${net}`, JSON.stringify({ n: netInfo.n + 1 }));
-    await env.BOXES.put("count", String(total + 1));
-    await markUsed(env, id);
-
-    if (env.DISCORD_WEBHOOK && !held) {
-      ctx.waitUntil(fetch(env.DISCORD_WEBHOOK, {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ content: `Box ${id} set up wireless sharing!` }),
-      }).catch(() => {}));
-    }
-    return json({ token: t.token, hostname: host }, held ? 200 : 201);
-  } catch (e) {
-    return json({ error: `Cloudflare said: ${e.message}` }, 502);
-  }
+  const port = Number(b.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return json({ error: "Bad port" }, 400);
+  const net = networkOf(request.headers.get("cf-connecting-ip") || "unknown");
+  return answer(await viaQueue(env, "tunnel", { id, port, key_hash: keyHash, net, host }));
 }
 
+const answer = ([status, body]) => json(body, status);
+
 async function boxApi(request, env) {
-  if (!env.BOXES) return json({ error: "Box IDs aren't set up on this server yet." }, 503);
+  if (!env.DB || !env.JOBS) return json({ error: "Box IDs aren't set up on this server yet." }, 503);
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
   let b;
   try { b = await request.json(); } catch { b = {}; }
   const net = networkOf(request.headers.get("cf-connecting-ip") || "unknown");
-  const dayKey = `boxday:${net}:${new Date().toISOString().slice(0, 10)}`;
-  const today = Number(await env.BOXES.get(dayKey) || 0);
-  if (today >= Number(env.BOXES_PER_NETWORK_PER_DAY || 5)) return json({ error: "Too many new box IDs from this network today. Try again tomorrow." }, 429);
-
-  let id, key, used = false;
+  const data = { net, day: new Date().toISOString().slice(0, 10) };
   if (b && b.id !== undefined) {
-    id = String(b.id);
-    if (!/^\d{6,10}$/.test(id)) return json({ error: "Bad Printer Buddy ID" }, 400);
-    if (await env.BOXES.get(`id:${id}`)) return json({ error: "This Printer Buddy ID already belongs to a box." }, 409);
-    const old = await owner(env, id);
-    if (old && (typeof b.key !== "string" || await sha256(b.key) !== old.key_hash)) {
-      return json({ error: "This Printer Buddy ID is already set up on another box (or this box lost its key)." }, 403);
-    }
-    key = old ? b.key : newKey();
-    used = !!old;
-  } else {
-    id = await freeId(env);
-    if (!id) return json({ error: "Couldn't pick a free box ID, try again." }, 503);
-    key = newKey();
+    data.id = String(b.id);
+    if (!/^\d{6,10}$/.test(data.id)) return json({ error: "Bad Printer Buddy ID" }, 400);
+    if (typeof b.key === "string") data.given_hash = await sha256(b.key);
   }
-  const created = Date.now();
-  await env.BOXES.put(`id:${id}`, JSON.stringify({ key_hash: await sha256(key), created, used }), { metadata: { created, used } });
-  await env.BOXES.put(dayKey, String(today + 1), { expirationTtl: 2 * 24 * 3600 });
-  return json({ id, key }, 201);
+  if (await ready(env)) {
+    const pre = await sql(env, "SELECT COALESCE((SELECT n FROM box_days WHERE net = ?1 AND day = ?2), 0) AS today, EXISTS(SELECT 1 FROM ids WHERE id = ?3) AS taken",
+                          net, data.day, data.id ?? null).first();
+    if (pre.today >= Number(env.BOXES_PER_NETWORK_PER_DAY || 5)) return json({ error: "Too many new box IDs from this network today. Try again tomorrow." }, 429);
+    if (data.id && pre.taken) return json({ error: "This Printer Buddy ID already belongs to a box." }, 409);
+  }
+  const key = newKey();
+  data.new_hash = await sha256(key);
+  const [status, body] = await viaQueue(env, "box", data);
+  if (status !== 201) return json(body, status);
+  return json({ id: body.id, key: body.key === "given" ? b.key : key }, 201);
 }
 
 // The Discord bot puts a box on the allow list:  POST /api/register  {"id": "1234567"}  (authorization: Bearer <REGISTER_SECRET>)
 async function registerApi(request, env) {
-  if (!env.REGISTER_SECRET || !env.BOXES) return json({ error: "Registering isn't set up on this server yet." }, 503);
+  if (!env.REGISTER_SECRET || !env.DB || !env.JOBS) return json({ error: "Registering isn't set up on this server yet." }, 503);
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
   if (request.headers.get("authorization") !== `Bearer ${env.REGISTER_SECRET}`) return json({ error: "Not allowed" }, 403);
   let b;
   try { b = await request.json(); } catch { return json({ error: "Bad request" }, 400); }
   const id = String(b.id || "");
   if (!/^\d{6,10}$/.test(id)) return json({ error: "Bad Printer Buddy ID" }, 400);
-  if (!(await owner(env, id))) return json({ error: "No box has that ID." }, 404);
-  await env.BOXES.put(`allowed:${id}`, "1");
-  await markUsed(env, id);
-  return json({ ok: true, id });
+  if (await ready(env) && !(await owner(env, id))) return json({ error: "No box has that ID." }, 404);
+  return answer(await viaQueue(env, "register", { id }));
 }
 
 // Other programs that use the relay register as an app, and every box ID they get remembers the app:
@@ -399,144 +347,276 @@ async function registerApi(request, env) {
 //   POST /api/app/off | /on     {"name"}  (Bearer REGISTER_SECRET)  every box ID from that app is refused / allowed again
 async function appApi(request, env, url) {
   const path = url.pathname;
-  if (!env.REGISTER_SECRET || !env.BOXES) return json({ error: "Apps aren't set up on this server yet." }, 503);
+  if (!env.REGISTER_SECRET || !env.DB || !env.JOBS) return json({ error: "Apps aren't set up on this server yet." }, 503);
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
   let b;
   try { b = await request.json(); } catch { return json({ error: "Bad request" }, 400); }
   const name = String(b.name || "").toLowerCase();
   if (!/^[a-z0-9][a-z0-9_-]{1,39}$/.test(name)) return json({ error: "App name: 2 to 40 letters, numbers, - or _" }, 400);
-  const appKey = `app:${name}`, app = await env.BOXES.get(appKey, "json");
+  const checked = await ready(env);
+  const app = checked ? await sql(env, "SELECT key_hash, ids, off FROM apps WHERE name = ?", name).first() : null;
 
   if (path === "/api/app/ids") {
-    if (!app || typeof b.key !== "string" || await sha256(b.key) !== app.key_hash) return json({ error: "App name and key don't match." }, 403);
-    if (await env.BOXES.get(`appoff:${name}`)) return json({ error: "This app has been turned off by Printer Buddy." }, 403);
-    if (app.ids) return json({ error: "This app already got its box IDs." }, 409);
-    const ids = [], created = Date.now();
-    for (let i = 0; i < Number(env.APP_IDS || 50); i++) {
-      const id = await freeId(env);
-      if (!id) break;
-      const key = newKey();
-      await env.BOXES.put(`id:${id}`, JSON.stringify({ key_hash: await sha256(key), created, used: false, app: name }), { metadata: { created, used: false } });
-      ids.push({ id, key });
-    }
-    await env.BOXES.put(appKey, JSON.stringify({ ...app, ids: ids.length }));
-    return json({ ids }, 201);
+    const keyHash = typeof b.key === "string" ? await sha256(b.key) : null;
+    if (!keyHash || (checked && (!app || keyHash !== app.key_hash))) return json({ error: "App name and key don't match." }, 403);
+    if (checked && app.off) return json({ error: "This app has been turned off by Printer Buddy." }, 403);
+    if (checked && app.ids) return json({ error: "This app already got its box IDs." }, 409);
+    const keys = Array.from({ length: Number(env.APP_IDS || 50) }, newKey);
+    const [status, body] = await viaQueue(env, "app-ids", { name, key_hash: keyHash, hashes: await Promise.all(keys.map(sha256)) });
+    if (status !== 201) return json(body, status);
+    return json({ ids: body.ids.map((id, i) => ({ id, key: keys[i] })) }, 201);
   }
 
   if (request.headers.get("authorization") !== `Bearer ${env.REGISTER_SECRET}`) return json({ error: "Not allowed" }, 403);
   if (path === "/api/app") {
     if (app) return json({ error: "That app is already registered." }, 409);
     const key = newKey();
-    await env.BOXES.put(appKey, JSON.stringify({ key_hash: await sha256(key), created: Date.now(), ids: 0 }));
-    return json({ name, key }, 201);
+    const [status, body] = await viaQueue(env, "app", { name, key_hash: await sha256(key) });
+    return status === 201 ? json({ name, key }, 201) : json(body, status);
   }
-  if (!app) return json({ error: "No app has that name." }, 404);
-  if (path === "/api/app/on") {
-    await env.BOXES.delete(`appoff:${name}`);
-    return json({ ok: true, name, off: false });
-  }
-  await env.BOXES.put(`appoff:${name}`, "1");
-  let removed = 0, cut = 0, failed = 0;
-  if (env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_ZONE_ID) {
-    const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
-    for (const kvKey of await listAll(env, "box:")) {
-      const id = kvKey.slice(4), rec = await env.BOXES.get(`id:${id}`, "json");
-      if (!rec || rec.app !== name) continue;
-      const box = await env.BOXES.get(kvKey, "json");
-      if (!box) continue;
-      let deleted;
-      try {
-        await env.BOXES.put(kvKey, JSON.stringify({ ...box, cut: true }));
-        deleted = await cutTunnel(env, `u${id}.${domain}`, box.tunnel_id);
-      } catch {
-        failed++;
-        continue;
-      }
-      if (!deleted) {
-        cut++;
-        continue;
-      }
-      await env.BOXES.delete(kvKey);
-      await freeSlot(env, box);
-      removed++;
-    }
-  }
-  return json({ ok: true, name, off: true, tunnels_removed: removed, tunnels_cut: cut, tunnels_failed: failed });
-}
-
-async function listAll(env, prefix) {
-  const out = [];
-  let cursor;
-  do {
-    const page = await env.BOXES.list({ prefix, cursor });
-    out.push(...page.keys.map(k => k.name));
-    cursor = page.list_complete ? null : page.cursor;
-  } while (cursor);
-  return out;
+  if (checked && !app) return json({ error: "No app has that name." }, 404);
+  const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
+  return answer(await viaQueue(env, path === "/api/app/on" ? "app-on" : "app-off", { name, domain }));
 }
 
 // Hourly: remove tunnels that never connected within an hour (freed), and tunnels offline for 4 days
-// (ID held for the box). Delete leftover pb-u tunnels with no record, then recount the slots.
+// (ID held for the box), and leftover pb-u tunnels with no record. Each removal is its own job.
 async function cleanupTunnels(env, url) {
-  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.CF_ZONE_ID || !env.BOXES) return;
-  const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
-  const now = Date.now(), HOUR = 3600 * 1000;
-  const tunnels = new Map();
-  for (let page = 1; ; page++) {
-    const list = await cf(env, "GET", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=1000&page=${page}`);
-    for (const t of list || []) if (/^pb-u\d{6,10}$/.test(t.name)) tunnels.set(t.name, t);
-    if (!list || list.length < 1000) break;
-  }
-
-  const nets = {};
-  let count = 0;
-  for (const kvKey of await listAll(env, "box:")) {
-    const id = kvKey.slice(4), box = await env.BOXES.get(kvKey, "json");
-    if (!box) continue;
-    const t = tunnels.get(`pb-u${id}`);
-    tunnels.delete(`pb-u${id}`);
-    const neverConnected = t && t.status === "inactive" && now - Date.parse(t.created_at) > HOUR;
-    const offline = t && t.status === "down" && t.conns_inactive_at && now - Date.parse(t.conns_inactive_at) > 4 * 24 * HOUR;
-    const young = !t && now - (box.created || 0) < HOUR;
-    if (!young && (!t || neverConnected || offline)) {
-      let gone = true;
-      if (t) { try { await removeTunnel(env, `u${id}.${domain}`, t.id); } catch { gone = false; } }
-      if (gone) {
-        await env.BOXES.delete(kvKey);
-        if (offline) await env.BOXES.put(`held:${id}`, JSON.stringify({ key_hash: box.key_hash, net: box.net || null, held: now }));
-        continue;
+  if (!env.DB || !env.JOBS) return;
+  if (!(await ready(env))) return queueJob(env, "migrate", {});
+  const jobs = [{ type: "tidy", data: {} }];
+  if (env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_ZONE_ID) {
+    const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
+    const now = Date.now(), HOUR = 3600 * 1000;
+    const tunnels = new Map();
+    for (let page = 1; ; page++) {
+      const list = await cf(env, "GET", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=1000&page=${page}`);
+      for (const t of list || []) if (/^pb-u\d{6,10}$/.test(t.name)) tunnels.set(t.name, t);
+      if (!list || list.length < 1000) break;
+    }
+    const { results: boxes } = await sql(env, "SELECT id, tunnel_id, created FROM boxes").all();
+    for (const box of boxes) {
+      const t = tunnels.get(`pb-u${box.id}`);
+      tunnels.delete(`pb-u${box.id}`);
+      const neverConnected = t && t.status === "inactive" && now - Date.parse(t.created_at) > HOUR;
+      const offline = t && t.status === "down" && t.conns_inactive_at && now - Date.parse(t.conns_inactive_at) > 4 * 24 * HOUR;
+      const young = !t && now - (box.created || 0) < HOUR;
+      if (!young && (!t || neverConnected || offline)) {
+        jobs.push({ type: "remove-box", data: { id: box.id, tunnel_id: box.tunnel_id, cf_id: t ? t.id : null, offline: !!offline, host: `u${box.id}.${domain}` } });
       }
     }
-    count++;
-    if (box.net) nets[box.net] = (nets[box.net] || 0) + 1;
-  }
-
-  for (const [name, t] of tunnels) {
-    if (now - Date.parse(t.created_at) < HOUR) continue;
-    try { await removeTunnel(env, `${name.slice(3)}.${domain}`, t.id); } catch {}
-  }
-
-  for (const netKey of await listAll(env, "net:")) {
-    const net = netKey.slice(4), cur = (await env.BOXES.get(netKey, "json")) || { n: 0 };
-    const n = nets[net] || 0;
-    if (cur.n !== n) await env.BOXES.put(netKey, JSON.stringify({ n }));
-  }
-  await env.BOXES.put("count", String(count));
-}
-
-// Daily: delete box IDs that were never used (no tunnel, no photo, not registered) 30 days after they were handed out.
-async function cleanupIds(env) {
-  if (!env.BOXES) return;
-  const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
-  let cursor;
-  do {
-    const page = await env.BOXES.list({ prefix: "id:", cursor });
-    for (const k of page.keys) {
-      if (k.metadata && !k.metadata.used && k.metadata.created < cutoff) await env.BOXES.delete(k.name);
+    for (const [name, t] of tunnels) {
+      if (now - Date.parse(t.created_at) < HOUR) continue;
+      jobs.push({ type: "remove-tunnel", data: { id: name.slice(4), cf_id: t.id, host: `${name.slice(3)}.${domain}` } });
     }
-    cursor = page.list_complete ? null : page.cursor;
-  } while (cursor);
+  }
+  await sendJobs(env, jobs);
 }
+
+// Copies the KV records into D1, 300 keys per job, and keeps its place in meta.
+const MIGRATE = ["app:", "appoff:", "id:", "box:", "held:", "allowed:"];
+
+async function migrateStep(env) {
+  const at = JSON.parse((await sql(env, "SELECT v FROM meta WHERE k = 'migrate'").first("v")) || '{"p":0}');
+  const prefix = MIGRATE[at.p];
+  const page = await env.BOXES.list({ prefix, cursor: at.c, limit: 300 });
+  const writes = [];
+  for (const { name } of page.keys) {
+    const k = name.slice(prefix.length);
+    if (prefix === "appoff:") { writes.push(sql(env, "UPDATE apps SET off = 1 WHERE name = ?", k)); continue; }
+    if (prefix === "allowed:") { writes.push(sql(env, "INSERT OR IGNORE INTO allowed (id) VALUES (?)", k)); continue; }
+    const v = await env.BOXES.get(name, "json");
+    if (!v) continue;
+    if (prefix === "app:") {
+      writes.push(sql(env, "INSERT OR IGNORE INTO apps (name, key_hash, created, ids, off) VALUES (?, ?, ?, ?, 0)", k, v.key_hash ?? null, v.created ?? 0, v.ids ?? 0));
+    } else if (prefix === "id:") {
+      writes.push(sql(env, "INSERT OR IGNORE INTO ids (id, key_hash, created, used, app) VALUES (?, ?, ?, ?, ?)", k, v.key_hash ?? null, v.created ?? 0, v.used ? 1 : 0, v.app ?? null));
+    } else if (prefix === "box:") {
+      writes.push(sql(env, "INSERT OR IGNORE INTO boxes (id, tunnel_id, token, key_hash, port, net, cut, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      k, v.tunnel_id ?? null, v.token ?? null, v.key_hash ?? null, v.port ?? null, v.net ?? null, v.cut ? 1 : 0, v.created ?? 0, v.updated ?? 0));
+    } else {
+      writes.push(sql(env, "INSERT OR IGNORE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", k, v.key_hash ?? null, v.net ?? null, v.held ?? 0));
+    }
+  }
+  const next = page.list_complete ? { p: at.p + 1 } : { p: at.p, c: page.cursor };
+  const done = next.p >= MIGRATE.length;
+  writes.push(sql(env, "INSERT OR REPLACE INTO meta (k, v) VALUES ('migrate', ?)", JSON.stringify(next)));
+  if (done) writes.push(sql(env, "INSERT OR REPLACE INTO meta (k, v) VALUES ('migrated', '1')"));
+  await env.DB.batch(writes);
+  return done;
+}
+
+async function runJob(env, job) {
+  if (!(await ready(env)) && !(await migrateStep(env))) {
+    await env.JOBS.send(job);
+    return;
+  }
+  if (job.type === "migrate") return;
+  if (await sql(env, "SELECT 1 FROM results WHERE job = ?", job.job).first()) return;
+  const [status, body, writes = []] = await JOBS[job.type](env, job.data);
+  await env.DB.batch([...writes, sql(env, "INSERT INTO results (job, status, body, created) VALUES (?, ?, ?, ?)", job.job, status, JSON.stringify(body), Date.now())]);
+}
+
+// Each job returns [status, body, writes]; the writes are saved together with its answer.
+function keyRefused(own, box, held, keyHash) {
+  if (!own) return [403, { error: NOT_HANDED_OUT }];
+  if (!keyHash || (box && keyHash !== box.key_hash) || (held && keyHash !== held.key_hash) || keyHash !== own.key_hash) return [403, { error: OTHER_BOX }];
+  return null;
+}
+
+const JOBS = {
+  async tunnel(env, { id, port, key_hash: keyHash, net, host }) {
+    const box = await sql(env, "SELECT * FROM boxes WHERE id = ?", id).first();
+    const held = box ? null : await sql(env, "SELECT * FROM held WHERE id = ?", id).first();
+    const own = await owner(env, id);
+    const refused = keyRefused(own, box, held, keyHash);
+    if (refused) return refused;
+    if (own.off) return [403, { error: APP_OFF }];
+    try {
+      if (box) {
+        if (box.port !== port || box.cut) {
+          await routing(env, box.tunnel_id, host, port);
+          if (box.cut) await pointDns(env, host, box.tunnel_id);
+        }
+        return [200, { token: box.token, hostname: host }, [sql(env, "UPDATE boxes SET port = ?, cut = 0, updated = ? WHERE id = ?", port, Date.now(), id)]];
+      }
+      const n = await sql(env, "SELECT COUNT(*) AS total, COALESCE(SUM(net = ?1), 0) AS here, EXISTS(SELECT 1 FROM allowed WHERE id = ?2) AS allowed FROM boxes", net, id).first();
+      if (n.total >= Number(env.MAX_TUNNELS || 500)) return [503, { error: "Wireless sharing is full right now. Please tell the Printer Buddy team." }];
+      const limit = n.allowed ? Number(env.REGISTERED_PER_NETWORK || 5) : 1;
+      if (n.here >= limit) {
+        return [429, { error: n.allowed ? `This network already has ${limit} boxes sharing.`
+                                        : "This network already has a box sharing. Register this box with /register <box ID> in the Printer Buddy Discord to share up to 5 on one network." }];
+      }
+      const t = await makeTunnel(env, id, host, port);
+      const now = Date.now();
+      const writes = [
+        sql(env, "INSERT INTO boxes (id, tunnel_id, token, key_hash, port, net, cut, created, updated) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)", id, t.id, t.token, own.key_hash, port, net, now, now),
+        sql(env, "UPDATE ids SET used = 1 WHERE id = ?", id),
+      ];
+      if (held) writes.push(sql(env, "DELETE FROM held WHERE id = ?", id));
+      if (env.DISCORD_WEBHOOK && !held) {
+        await fetch(env.DISCORD_WEBHOOK, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ content: `Box ${id} set up wireless sharing!` }),
+        }).catch(() => {});
+      }
+      return [held ? 200 : 201, { token: t.token, hostname: host }, writes];
+    } catch (e) {
+      return [502, { error: `Cloudflare said: ${e.message}` }];
+    }
+  },
+
+  async untunnel(env, { id, key_hash: keyHash, hold, host }) {
+    const box = await sql(env, "SELECT * FROM boxes WHERE id = ?", id).first();
+    const held = box ? null : await sql(env, "SELECT * FROM held WHERE id = ?", id).first();
+    const refused = keyRefused(await owner(env, id), box, held, keyHash);
+    if (refused) return refused;
+    if (!box) return [200, { ok: true, note: "nothing to remove" }, held && !hold ? [sql(env, "DELETE FROM held WHERE id = ?", id)] : []];
+    try {
+      await removeTunnel(env, host, box.tunnel_id);
+    } catch (e) {
+      return [409, { error: `The tunnel is still connected. Stop cloudflared on the box and try again in a minute. (${e.message})` }];
+    }
+    const writes = [sql(env, "DELETE FROM boxes WHERE id = ?", id)];
+    if (hold) writes.push(sql(env, "INSERT OR REPLACE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", id, box.key_hash, box.net, Date.now()));
+    return [200, { ok: true }, writes];
+  },
+
+  async box(env, { id: given, given_hash: givenHash, new_hash: newHash, net, day }) {
+    const today = (await sql(env, "SELECT n FROM box_days WHERE net = ? AND day = ?", net, day).first("n")) || 0;
+    if (today >= Number(env.BOXES_PER_NETWORK_PER_DAY || 5)) return [429, { error: "Too many new box IDs from this network today. Try again tomorrow." }];
+    let id = given, hash = newHash, used = 0, key = "new";
+    if (given !== undefined) {
+      if (await sql(env, "SELECT 1 FROM ids WHERE id = ?", given).first()) return [409, { error: "This Printer Buddy ID already belongs to a box." }];
+      const old = await owner(env, given);
+      if (old && (!givenHash || givenHash !== old.key_hash)) return [403, { error: "This Printer Buddy ID is already set up on another box (or this box lost its key)." }];
+      if (old) [hash, used, key] = [givenHash, 1, "given"];
+    } else {
+      [id] = await freeIds(env, 1);
+      if (!id) return [503, { error: "Couldn't pick a free box ID, try again." }];
+    }
+    return [201, { id, key }, [
+      sql(env, "INSERT INTO ids (id, key_hash, created, used) VALUES (?, ?, ?, ?)", id, hash, Date.now(), used),
+      sql(env, "INSERT INTO box_days (net, day, n) VALUES (?, ?, 1) ON CONFLICT (net, day) DO UPDATE SET n = n + 1", net, day),
+    ]];
+  },
+
+  async register(env, { id }) {
+    if (!(await owner(env, id))) return [404, { error: "No box has that ID." }];
+    return [200, { ok: true, id }, [sql(env, "INSERT OR IGNORE INTO allowed (id) VALUES (?)", id), sql(env, "UPDATE ids SET used = 1 WHERE id = ?", id)]];
+  },
+
+  async app(env, { name, key_hash: keyHash }) {
+    if (await sql(env, "SELECT 1 FROM apps WHERE name = ?", name).first()) return [409, { error: "That app is already registered." }];
+    return [201, { name }, [sql(env, "INSERT INTO apps (name, key_hash, created, ids, off) VALUES (?, ?, ?, 0, 0)", name, keyHash, Date.now())]];
+  },
+
+  async "app-ids"(env, { name, key_hash: keyHash, hashes }) {
+    const app = await sql(env, "SELECT key_hash, ids, off FROM apps WHERE name = ?", name).first();
+    if (!app || keyHash !== app.key_hash) return [403, { error: "App name and key don't match." }];
+    if (app.off) return [403, { error: "This app has been turned off by Printer Buddy." }];
+    if (app.ids) return [409, { error: "This app already got its box IDs." }];
+    const ids = await freeIds(env, hashes.length), created = Date.now();
+    const writes = ids.map((id, i) => sql(env, "INSERT INTO ids (id, key_hash, created, used, app) VALUES (?, ?, ?, 0, ?)", id, hashes[i], created, name));
+    writes.push(sql(env, "UPDATE apps SET ids = ? WHERE name = ?", ids.length, name));
+    return [201, { ids }, writes];
+  },
+
+  async "app-on"(env, { name }) {
+    if (!(await sql(env, "SELECT 1 FROM apps WHERE name = ?", name).first())) return [404, { error: "No app has that name." }];
+    return [200, { ok: true, name, off: false }, [sql(env, "UPDATE apps SET off = 0 WHERE name = ?", name)]];
+  },
+
+  // Turning an app off sends one cut-box job per box, so each box gets its own run and its own 50 outside calls.
+  async "app-off"(env, { name, domain }) {
+    if (!(await sql(env, "SELECT 1 FROM apps WHERE name = ?", name).first())) return [404, { error: "No app has that name." }];
+    await sql(env, "UPDATE apps SET off = 1 WHERE name = ?", name).run();
+    let boxes = [];
+    if (env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_ZONE_ID) {
+      ({ results: boxes } = await sql(env, "SELECT boxes.id, boxes.tunnel_id FROM boxes JOIN ids ON ids.id = boxes.id WHERE ids.app = ?", name).all());
+      await sendJobs(env, boxes.map(b => ({ type: "cut-box", data: { id: b.id, tunnel_id: b.tunnel_id, host: `u${b.id}.${domain}` } })));
+    }
+    return [200, { ok: true, name, off: true, boxes: boxes.length }];
+  },
+
+  // A tunnel that's still connected can't be deleted: it's cut (no routing, no address) and its box marked cut.
+  async "cut-box"(env, { id, tunnel_id: tunnelId, host }) {
+    const box = await sql(env, "SELECT tunnel_id FROM boxes WHERE id = ?", id).first();
+    const own = await owner(env, id);
+    if (!box || box.tunnel_id !== tunnelId || !own || !own.off) return [200, { ok: true, note: "nothing to cut" }];
+    await sql(env, "UPDATE boxes SET cut = 1 WHERE id = ?", id).run();
+    const deleted = await cutTunnel(env, host, tunnelId);
+    return [200, { ok: true, deleted }, deleted ? [sql(env, "DELETE FROM boxes WHERE id = ?", id)] : []];
+  },
+
+  async "remove-box"(env, { id, tunnel_id: tunnelId, cf_id: cfId, offline, host }) {
+    const box = await sql(env, "SELECT key_hash, net, tunnel_id FROM boxes WHERE id = ?", id).first();
+    if (!box || box.tunnel_id !== tunnelId) return [200, { ok: true, note: "changed since" }];
+    if (cfId) await removeTunnel(env, host, cfId);
+    const writes = [sql(env, "DELETE FROM boxes WHERE id = ?", id)];
+    if (offline) writes.push(sql(env, "INSERT OR REPLACE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", id, box.key_hash, box.net, Date.now()));
+    return [200, { ok: true }, writes];
+  },
+
+  async "remove-tunnel"(env, { id, cf_id: cfId, host }) {
+    if (await sql(env, "SELECT 1 FROM boxes WHERE id = ? AND tunnel_id = ?", id, cfId).first()) return [200, { ok: true, note: "has a record" }];
+    await removeTunnel(env, host, cfId);
+    return [200, { ok: true }];
+  },
+
+  async tidy(env) {
+    return [200, { ok: true }, [sql(env, "DELETE FROM results WHERE created < ?", Date.now() - 3600 * 1000)]];
+  },
+
+  // Daily: delete box IDs that were never used (no tunnel, no photo, not registered) 30 days after they were handed out.
+  async "cleanup-ids"(env) {
+    const day = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    return [200, { ok: true }, [
+      sql(env, "DELETE FROM ids WHERE used = 0 AND created < ?", Date.now() - 30 * 24 * 3600 * 1000),
+      sql(env, "DELETE FROM box_days WHERE day < ?", day),
+    ]];
+  },
+};
 
 // A box that opted in ("Help improve the AI") sends one labelled photo:
 //   POST /api/contribute  {"id": "1234567", "label": "spaghetti", "source": "alert_yes",
@@ -552,18 +632,22 @@ const SOURCES = ["alert_yes", "alert_no", "print_ok", "print_failed", "user"];
 const VERDICTS = ["right", "false_alarm", "missed"];
 
 async function contributeApi(request, env) {
-  if (!env.GITHUB_TOKEN || !env.DATA_REPO || !env.BOXES) return json({ error: "Photo sharing isn't set up on this server yet." }, 503);
+  if (!env.GITHUB_TOKEN || !env.DATA_REPO || !env.BOXES || !env.DB || !env.JOBS) return json({ error: "Photo sharing isn't set up on this server yet." }, 503);
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
   let b;
   try { b = await request.json(); } catch { return json({ error: "Bad request" }, 400); }
   const id = String(b.id || ""), label = String(b.label || ""), source = String(b.source || "user");
   if (!/^\d{6,10}$/.test(id)) return json({ error: "Bad Printer Buddy ID" }, 400);
+  if (!(await ready(env))) {
+    await queueJob(env, "migrate", {});
+    return json({ error: "The Printer Buddy server is updating. Try again in a minute." }, 503);
+  }
   const own = await owner(env, id);
   if (!own || typeof b.key !== "string" || await sha256(b.key) !== own.key_hash) {
     return json({ error: "This box ID and key don't match. Update Printer Buddy to get a box ID." }, 403);
   }
-  if (await appOff(env, own)) return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
-  await markUsed(env, id);
+  if (own.off) return json({ error: APP_OFF }, 403);
+  await sql(env, "UPDATE ids SET used = 1 WHERE id = ?", id).run();
   if (RETIRED_LABELS.includes(label)) return json({ ok: true, note: `${label} photos are no longer collected` }, 201);
   if (!LABELS.includes(label)) return json({ error: `label must be one of: ${LABELS.join(", ")}` }, 400);
   if (!SOURCES.includes(source)) return json({ error: "Bad source" }, 400);

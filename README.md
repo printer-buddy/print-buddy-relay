@@ -17,13 +17,18 @@ Every hour the Worker removes tunnels that never connected within an hour, and t
 same address back next time). Every day it deletes box IDs that were never used 30 days after they were handed out.
 Other programs that use the relay register as an app and get 50 box IDs; each ID remembers its app, and turning an app off
 stops every ID it got (tunnels and photos).
+Every change to box IDs, tunnels, the allow list and apps is a job on a Cloudflare queue that runs one job at a time, so two
+changes never overlap; a request waits up to 20 seconds for its answer. On the Workers Free plan the queue takes about 3,300
+jobs a day (10,000 operations, 3 per job): one per request, plus one per box when an app is turned off or the hourly cleanup removes it.
 
 ## Automatic deploys
 
 `wrangler.toml` lets Cloudflare deploy `worker.js` itself on every push to GitHub, so there's no more pasting code:
 **Workers & Pages > printer-buddy-share > Settings > Builds > Connect** > repository `printer-buddy`, branch `main`,
 root directory `relay`, build command empty, deploy command `npx wrangler deploy`.
-Dashboard variables are kept (`keep_vars`), secrets are never touched. The KV binding, route and daily trigger come from `wrangler.toml`.
+Dashboard variables are kept (`keep_vars`), secrets are never touched. The KV, D1 and queue bindings, the queue's one-job-at-a-time settings, the route and the triggers come from `wrangler.toml`.
+The first deploy makes the D1 database `printer-buddy` and the queue `printer-buddy-jobs`, and the first job after it copies
+the box records from KV into D1 (KV is left as it was).
 
 ## One-time setup
 
@@ -39,7 +44,7 @@ Cloudflare dashboard > **My Profile > API Tokens > Create Token > Custom token**
 ### 2. Account ID and Zone ID
 Open **printerbuddy.stream** in the dashboard. The right-hand column of the Overview page shows **Zone ID** and **Account ID**.
 
-### 3. KV storage (remembers each box's tunnel)
+### 3. KV storage (photo limits and AI stats)
 **Workers & Pages > KV > Create namespace**, name it `printer-buddy-boxes`.
 
 ### 4. Discord webhook (announcements)
@@ -51,6 +56,8 @@ Open the `printer-buddy-share` Worker (see the top of `worker.js` if it doesn't 
 | Where | Name | Value |
 |---|---|---|
 | Bindings > Add > KV namespace | `BOXES` | `printer-buddy-boxes` |
+| Bindings > Add > D1 database | `DB` | `printer-buddy` (made by the first deploy) |
+| Bindings > Add > Queue | `JOBS` | `printer-buddy-jobs` (made by the first deploy) |
 | Variables and Secrets (type **Secret**) | `CF_API_TOKEN` | token from step 1 |
 | Variables and Secrets (type **Secret**) | `DISCORD_WEBHOOK` | URL from step 4 |
 | Variables and Secrets (type **Text**) | `CF_ACCOUNT_ID` | from step 2 |
@@ -71,7 +78,8 @@ Apps (all `POST` with `content-type: application/json`):
 |---|---|---|---|
 | `/api/app` | `{"name": "someapp"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"name", "key"}` (the app's key, shown once) |
 | `/api/app/ids` | `{"name", "key"}` | the app's key | `{"ids": [{"id", "key"}, ...]}`, its 50 box IDs, once |
-| `/api/app/off`, `/api/app/on` | `{"name"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"ok": true, "name", "off"}` |
+| `/api/app/off` | `{"name"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"ok": true, "name", "off": true, "boxes"}`; then each of those boxes' tunnels is removed (cut if still connected) in its own job |
+| `/api/app/on` | `{"name"}` | `authorization: Bearer <REGISTER_SECRET>` | `{"ok": true, "name", "off": false}` |
 
 The route `www.printerbuddy.stream/*` must point at this Worker (it already does if share links work).
 
@@ -97,13 +105,15 @@ curl -s -X DELETE https://www.printerbuddy.stream/api/tunnel -H 'content-type: a
 
 | Reply | Meaning |
 |---|---|
-| `Automatic setup isn't configured on this server yet.` | a setting from step 5 is missing (or the KV binding isn't named `BOXES`) |
+| `Automatic setup isn't configured on this server yet.` | a setting from step 5 is missing (or the D1 and queue bindings aren't named `DB` and `JOBS`) |
 | `Cloudflare said: ... Authentication error` | the API token is wrong or lacks a permission from step 1 |
 | `This Printer Buddy ID wasn't handed out by the relay` | get a box ID from `/api/box` first |
 | `This Printer Buddy ID is already set up on another box` | the key didn't match that ID |
 | `This network already has a box sharing` | another box on that network is sharing; register this box with `/register <box ID>` in the Discord |
 | `Too many new box IDs from this network today` | 5 IDs per network per day; try tomorrow |
 | `The tunnel is still connected` (on DELETE) | stop cloudflared on that box, wait a minute, try again |
+| `The Printer Buddy server is busy. Try again in a minute.` | the queue didn't answer within 20 seconds; the request still runs, and asking again is safe |
+| `The Printer Buddy server is updating. Try again in a minute.` (photos) | right after a deploy, while the box records are copied from KV into D1 |
 
 ## Training photos (`/api/contribute`)
 
