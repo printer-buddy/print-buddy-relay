@@ -34,6 +34,7 @@ export default {
     if (url.pathname === "/api/tunnel") return tunnelApi(request, env, url);
     if (url.pathname === "/api/box") return boxApi(request, env);
     if (url.pathname === "/api/register") return registerApi(request, env);
+    if (url.pathname === "/api/discord") return discordApi(request, env, ctx, url);
     if (["/api/app", "/api/app/ids", "/api/app/off", "/api/app/on"].includes(url.pathname)) return appApi(request, env, url);
     if (url.pathname === "/api/contribute") return contributeApi(request, env);
     if (url.pathname === "/api/ai-stats") return statsApi(env);
@@ -181,7 +182,7 @@ const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS boxes (id TEXT PRIMARY KEY, tunnel_id TEXT, token TEXT, key_hash TEXT, port INTEGER, net TEXT, cut INTEGER DEFAULT 0, created INTEGER, updated INTEGER)",
   "CREATE TABLE IF NOT EXISTS held (id TEXT PRIMARY KEY, key_hash TEXT, net TEXT, held INTEGER)",
   "CREATE TABLE IF NOT EXISTS allowed (id TEXT PRIMARY KEY)",
-  "CREATE TABLE IF NOT EXISTS apps (name TEXT PRIMARY KEY, key_hash TEXT, created INTEGER, ids INTEGER DEFAULT 0, off INTEGER DEFAULT 0)",
+  "CREATE TABLE IF NOT EXISTS apps (name TEXT PRIMARY KEY, key_hash TEXT, created INTEGER, ids INTEGER DEFAULT 0, off INTEGER DEFAULT 0, pending INTEGER DEFAULT 0, requested_by TEXT)",
   "CREATE TABLE IF NOT EXISTS box_days (net TEXT, day TEXT, n INTEGER, PRIMARY KEY (net, day))",
   "CREATE TABLE IF NOT EXISTS results (job TEXT PRIMARY KEY, status INTEGER, body TEXT, created INTEGER)",
   "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
@@ -448,6 +449,121 @@ async function appApi(request, env, url) {
   return answer(await viaQueue(env, path === "/api/app/on" ? "app-on" : "app-off", { name, domain }));
 }
 
+// Discord sends its slash commands here (the app's Interactions Endpoint URL), signed with the app's Ed25519 key.
+// Discord wants an answer within 3 seconds, so the reply is "thinking…" first and the result is edited in afterwards.
+//   /register id:<box ID>           anyone: the box goes on the allow list
+//   /register-app name:<name>       anyone: asks for an app; once approved, the same user gets its box IDs and keys
+//   /approve-app name:, /block app:, /unblock app:   admins of the Printer Buddy server only
+const DISCORD = "https://discord.com/api/v10";
+
+async function discordApi(request, env, ctx, url) {
+  if (!env.DISCORD_PUBLIC_KEY || !env.DB || !env.JOBS) return json({ error: "Discord isn't set up on this server yet." }, 503);
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  const body = await request.text();
+  if (!(await discordSigned(env, request, body))) return new Response("invalid request signature", { status: 401 });
+  let i;
+  try { i = JSON.parse(body); } catch { return json({ error: "Bad request" }, 400); }
+  if (i.type === 1) return json({ type: 1 });
+  if (i.type !== 2) return json({ error: "Bad request" }, 400);
+  ctx.waitUntil(discordCommand(env, url, i)
+    .catch(() => ({ content: "Something went wrong. Try again in a minute." }))
+    .then(reply => discordReply(i, reply)));
+  return json({ type: 5, data: { flags: 64 } });
+}
+
+async function discordSigned(env, request, body) {
+  const sig = request.headers.get("x-signature-ed25519") || "", ts = request.headers.get("x-signature-timestamp") || "";
+  if (!/^[0-9a-f]{128}$/i.test(sig) || !ts) return false;
+  const bytes = hex => Uint8Array.from(hex.match(/../g), b => parseInt(b, 16));
+  try {
+    const key = await crypto.subtle.importKey("raw", bytes(env.DISCORD_PUBLIC_KEY), { name: "Ed25519" }, false, ["verify"]);
+    return await crypto.subtle.verify({ name: "Ed25519" }, key, bytes(sig), new TextEncoder().encode(ts + body));
+  } catch {
+    return false;
+  }
+}
+
+function discordReply(i, { content, file }) {
+  const url = `${DISCORD}/webhooks/${i.application_id}/${i.token}/messages/@original`;
+  const payload = { content, allowed_mentions: { parse: [] } };
+  if (!file) return fetch(url, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).catch(() => {});
+  const form = new FormData();
+  form.append("payload_json", JSON.stringify({ ...payload, attachments: [{ id: 0, filename: file.name }] }));
+  form.append("files[0]", new Blob([file.text], { type: "text/csv" }), file.name);
+  return fetch(url, { method: "PATCH", body: form }).catch(() => {});
+}
+
+// Administrator (1 << 3) in the Printer Buddy server; checked here too, since a server can change who sees a command
+const isAdmin = (env, i) => !!env.DISCORD_GUILD_ID && i.guild_id === env.DISCORD_GUILD_ID && !!i.member
+                            && (BigInt(i.member.permissions || "0") & 8n) === 8n;
+
+async function discordCommand(env, url, i) {
+  const command = i.data && i.data.name;
+  const opt = Object.fromEntries(((i.data && i.data.options) || []).map(o => [o.name, String(o.value).trim()]));
+  const user = ((i.member && i.member.user) || i.user || {}).id;
+  const checked = await ready(env);
+
+  if (command === "register") {
+    const id = opt.id || "";
+    if (!/^\d{6,10}$/.test(id)) return { content: "That isn't a box ID. It's the number under Box ID in the Printer Buddy menu." };
+    if (checked && !(await owner(env, id))) return { content: "No box has that ID." };
+    const [status, body] = await viaQueue(env, "register", { id });
+    return { content: status === 200 ? `Box ${id} is registered: up to ${Number(env.REGISTERED_PER_NETWORK || 5)} boxes on its network can share.` : body.error };
+  }
+
+  const name = (opt.name || opt.app || "").toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{1,39}$/.test(name)) return { content: "App name: 2 to 40 letters, numbers, - or _" };
+  if (!env.REGISTER_SECRET) return { content: "Apps aren't set up on this server yet." };
+  const app = checked ? await sql(env, "SELECT off, pending, requested_by FROM apps WHERE name = ?", name).first() : null;
+
+  if (command === "register-app") {
+    if (app && app.requested_by !== user) return { content: "That app name is taken." };
+    if (app && app.off) return { content: "This app has been turned off by Printer Buddy." };
+    if (app && !app.pending) return appPairs(env, name);
+    const waiting = `Your request for **${name}** is waiting for a Printer Buddy admin. Run /register-app name:${name} again once it's approved to get its box IDs.`;
+    if (app) return { content: waiting };
+    const [status, body] = await viaQueue(env, "app-request", { name, user });
+    if (status === 201 && env.DISCORD_ADMIN_WEBHOOK) {
+      await fetch(env.DISCORD_ADMIN_WEBHOOK, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: `App **${name}** requested by <@${user}>. Approve with /approve-app name:${name}`, allowed_mentions: { parse: [] } }),
+      }).catch(() => {});
+    }
+    if (status === 200 && !body.pending) return appPairs(env, name);
+    return { content: status === 200 || status === 201 ? waiting : body.error };
+  }
+
+  if (!isAdmin(env, i)) return { content: "Only Printer Buddy admins can do that." };
+  if (command === "approve-app") {
+    const key = await hmac(env.REGISTER_SECRET, `app:${name}`), n = Number(env.APP_IDS || 50);
+    const offer = await Promise.all(randomIds(n + 10).map(async id => ({ id, hash: await sha256(await hmac(key, id)) })));
+    const [status, body] = await viaQueue(env, "app-approve", { name, key_hash: await sha256(key), n, offer });
+    if (status !== 201) return { content: body.error };
+    return { content: `Approved **${name}** with ${body.ids} box IDs. <@${body.requested_by}> can get them with /register-app name:${name}` };
+  }
+  if (command === "block" || command === "unblock") {
+    if (checked && !app) return { content: "No app has that name." };
+    const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
+    const [status, body] = await viaQueue(env, command === "block" ? "app-off" : "app-on", { name, domain });
+    if (status !== 200) return { content: body.error };
+    return { content: command === "block" ? `**${name}** is blocked; ${body.boxes} of its boxes are being cut off.` : `**${name}** is unblocked.` };
+  }
+  return { content: "Unknown command." };
+}
+
+// An approved app's box IDs and keys, as a file (50 pairs are longer than a Discord message)
+async function appPairs(env, name) {
+  const key = await hmac(env.REGISTER_SECRET, `app:${name}`);
+  const rows = (await sql(env, "SELECT id, key_hash FROM ids WHERE app = ? ORDER BY id", name).all()).results;
+  const lines = [];
+  for (const r of rows) {
+    const k = await hmac(key, r.id);
+    if (await sha256(k) === r.key_hash) lines.push(`${r.id},${k}`);
+  }
+  return { content: `**${name}**: ${lines.length} box IDs and keys are in the file. Its app key is \`${key}\` (the same IDs come from /api/app/ids with it).`,
+           file: { name: `${name}-ids.csv`, text: `id,key\n${lines.join("\n")}\n` } };
+}
+
 // Hourly: remove tunnels that never connected within an hour (freed), and tunnels offline for 4 days
 // (ID held for the box), and leftover pb-u tunnels with no record. Each removal is its own job.
 async function cleanupTunnels(env, url) {
@@ -543,20 +659,27 @@ const JOBS = {
     if (refused) return refused;
     if (own.off) return [403, { error: APP_OFF }];
     try {
+      const n = await sql(env, "SELECT COUNT(*) AS total, COALESCE(SUM(net = ?1), 0) AS here, EXISTS(SELECT 1 FROM allowed WHERE id = ?2) AS allowed FROM boxes", net, id).first();
+      const limit = n.allowed ? Number(env.REGISTERED_PER_NETWORK || 5) : 1;
+      const full = n.here < limit ? null
+        : [429, { error: n.allowed ? `This network already has ${limit} boxes sharing.`
+                                   : "This network already has a box sharing. Register this box with /register <box ID> in the Printer Buddy Discord to share up to 5 on one network." }];
       if (box) {
+        // a box from before networks were stored counts toward the network it asks from; if that network is full,
+        // its tunnel is removed and its ID held, so it gets the same address back once there's room
+        if (!box.net && full) {
+          await removeTunnel(env, host, box.tunnel_id);
+          return [...full, [sql(env, "DELETE FROM boxes WHERE id = ?", id),
+                            sql(env, "INSERT OR REPLACE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", id, box.key_hash, net, Date.now())]];
+        }
         if (box.port !== port || box.cut) {
           await routing(env, box.tunnel_id, host, port);
           if (box.cut) await pointDns(env, host, box.tunnel_id);
         }
-        return [200, { token: box.token, hostname: host }, [sql(env, "UPDATE boxes SET port = ?, cut = 0, updated = ? WHERE id = ?", port, Date.now(), id)]];
+        return [200, { token: box.token, hostname: host }, [sql(env, "UPDATE boxes SET port = ?, cut = 0, updated = ?, net = COALESCE(net, ?) WHERE id = ?", port, Date.now(), net, id)]];
       }
-      const n = await sql(env, "SELECT COUNT(*) AS total, COALESCE(SUM(net = ?1), 0) AS here, EXISTS(SELECT 1 FROM allowed WHERE id = ?2) AS allowed FROM boxes", net, id).first();
       if (n.total >= Number(env.MAX_TUNNELS || 500)) return [503, { error: "Wireless sharing is full right now. Please tell the Printer Buddy team." }];
-      const limit = n.allowed ? Number(env.REGISTERED_PER_NETWORK || 5) : 1;
-      if (n.here >= limit) {
-        return [429, { error: n.allowed ? `This network already has ${limit} boxes sharing.`
-                                        : "This network already has a box sharing. Register this box with /register <box ID> in the Printer Buddy Discord to share up to 5 on one network." }];
-      }
+      if (full) return full;
       const t = await makeTunnel(env, id, host, port);
       const now = Date.now();
       const writes = [
@@ -639,6 +762,25 @@ const JOBS = {
     const writes = ids.map(id => sql(env, "INSERT INTO ids (id, key_hash, created, used, app) VALUES (?, ?, ?, 0, ?)", id, hashOf.get(id), created, name));
     writes.push(sql(env, "UPDATE apps SET ids = ? WHERE name = ?", ids.length, name));
     return [201, { ids }, writes];
+  },
+
+  // /register-app in Discord: the first ask saves a request; the same Discord user asking again sees where it stands
+  async "app-request"(env, { name, user }) {
+    const app = await sql(env, "SELECT pending, requested_by FROM apps WHERE name = ?", name).first();
+    if (app) return app.requested_by === user ? [200, { name, pending: !!app.pending }] : [409, { error: "That app name is taken." }];
+    return [201, { name, pending: true }, [sql(env, "INSERT INTO apps (name, key_hash, created, ids, off, pending, requested_by) VALUES (?, NULL, ?, 0, 0, 1, ?)", name, Date.now(), user)]];
+  },
+
+  // /approve-app in Discord: the app gets its key and its box IDs in one job
+  async "app-approve"(env, { name, key_hash: keyHash, n, offer }) {
+    const app = await sql(env, "SELECT pending, requested_by FROM apps WHERE name = ?", name).first();
+    if (!app) return [404, { error: "No app has asked for that name." }];
+    if (!app.pending) return [409, { error: "That app is already approved." }];
+    const hashOf = new Map(offer.map(o => [o.id, o.hash]));
+    const ids = await freeOf(env, offer.map(o => o.id), n), created = Date.now();
+    const writes = ids.map(id => sql(env, "INSERT INTO ids (id, key_hash, created, used, app) VALUES (?, ?, ?, 0, ?)", id, hashOf.get(id), created, name));
+    writes.push(sql(env, "UPDATE apps SET pending = 0, key_hash = ?, created = ?, ids = ? WHERE name = ?", keyHash, created, ids.length, name));
+    return [201, { name, ids: ids.length, requested_by: app.requested_by }, writes];
   },
 
   async "app-on"(env, { name }) {
