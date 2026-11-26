@@ -2,6 +2,18 @@
 
 All changes to the printerbuddy.stream Worker, newest first.
 
+################################2026-11-26 sterling m security/register-network################################
+
+## /register registers a network, not a single box
+
+`/register id:<box ID>` now registers the network the relay last saw that box on, and up to 5 boxes can share on a registered network; every other network stays at 1. The relay remembers a box's latest network only after its key matched: when it gets its ID, asks for or removes its tunnel, or sends a photo. A box the relay hasn't seen yet can't be registered and gets "The relay hasn't seen that box yet". *Why:* the limit is 1 tunnel per network unless the network is registered; registering put only that one box on the allow list.
+
+Lines changed:
+- `worker.js` — 117 comment; 190–195 the `seen` and `allowed_nets` tables and `seenAt`; 356–357 the box's network is sent with a tunnel removal; 396, 459 comments; 516 the `/register` reply; 659 the tunnel job remembers the network; 664 the limit checks `allowed_nets`; 706, 711 a tunnel removal remembers the network; 730, 747 getting an ID remembers the network; 751–756 the `register` job registers the box's last network, or answers 409; 900 a photo remembers the network
+- `README.md` — 15 the limit; 68, 77 `REGISTER_SECRET` and the register call; 96 what `/register` does
+
+################################end of entry################################
+
 ################################2026-11-26 sterling m security/app-request-notice################################
 
 ## Admins hear about an app request even if the /register-app command timed out

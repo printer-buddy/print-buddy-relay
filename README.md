@@ -12,7 +12,7 @@
 
 Only the box with the ID's key (kept in `printer-buddy.env` as `PB_BOX_KEY`) can set up, change, remove or get back its tunnel.
 Limits: 5 new box IDs per network per day, one tunnel per ID, one box sharing at a time per network (IPv6 counts per /64),
-5 for boxes on the allow list (`/register <box ID>` in the Discord), 500 in total. Removing a tunnel gives its slot back.
+5 on a network registered with `/register <box ID>` in the Discord (the network that box was last seen on), 500 in total. Removing a tunnel gives its slot back.
 A box that was sharing before networks were counted counts toward the network it next asks from; if that network is
 already full, its tunnel is removed and its ID held until there's room or it's registered.
 Every hour the Worker removes tunnels that never connected within an hour, and tunnels offline for 4 days (that box gets the
@@ -65,7 +65,7 @@ Open the `printer-buddy-share` Worker (see the top of `worker.js` if it doesn't 
 | Variables and Secrets (type **Text**) | `CF_ACCOUNT_ID` | from step 2 |
 | Variables and Secrets (type **Text**) | `CF_ZONE_ID` | from step 2 |
 | Variables and Secrets (type **Text**) | `SHARE_DOMAIN` | `printerbuddy.stream` |
-| Variables and Secrets (type **Secret**) | `REGISTER_SECRET` | any long random text; the Discord bot sends it to put a box on the allow list |
+| Variables and Secrets (type **Secret**) | `REGISTER_SECRET` | any long random text; the Discord bot sends it to register a box's network |
 | Variables and Secrets (type **Text**) | `DISCORD_PUBLIC_KEY` | the Discord app's public key (see Discord commands below) |
 | Variables and Secrets (type **Text**) | `DISCORD_GUILD_ID` | the Printer Buddy Discord server's ID; admin commands only work there |
 | Variables and Secrets (type **Secret**) | `DISCORD_ADMIN_WEBHOOK` | webhook URL for an admin-only channel; app requests are posted there |
@@ -74,7 +74,7 @@ Open the `printer-buddy-share` Worker (see the top of `worker.js` if it doesn't 
 | optional (Text) | `BOXES_PER_NETWORK_PER_DAY` | default `5` |
 | optional (Text) | `APP_IDS` | box IDs per app, default `50` |
 
-The Discord bot puts a box on the allow list with
+The Discord bot registers a box's network with
 `curl -s -X POST https://www.printerbuddy.stream/api/register -H "authorization: Bearer <REGISTER_SECRET>" -H 'content-type: application/json' -d '{"id": "1234567"}'` → `{"ok": true, "id": "1234567"}`.
 
 Apps (all `POST` with `content-type: application/json`):
@@ -93,7 +93,7 @@ Replies are only shown to the person who typed the command.
 
 | Command | Who | What it does |
 |---|---|---|
-| `/register id:<box ID>` | anyone | puts the box on the allow list: up to 5 boxes on its network can share |
+| `/register id:<box ID>` | anyone | registers the network that box was last seen on: up to 5 can share on it. A box the relay hasn't seen yet (no share link, Remote access off, no photos) can't be registered |
 | `/register-app name:<name>` | anyone | asks for an app; admins are told in `DISCORD_ADMIN_WEBHOOK`. Once approved, the same person running it again gets `<name>-ids.csv` (its 50 box IDs and keys) and the app key |
 | `/approve-app name:<name>` | admins | approves the app and makes its 50 box IDs |
 | `/block app:<name>`, `/unblock app:<name>` | admins | turns the app off (its tunnels and photos are refused, running tunnels cut) or back on |
