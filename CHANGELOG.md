@@ -2,6 +2,17 @@
 
 All changes to the printerbuddy.stream Worker, newest first.
 
+################################2026-11-25 sterling m security/dns-held################################
+
+## Removing a tunnel only takes its own address; an offline box keeps its ID when a removal is retried
+
+Removing or cutting a tunnel deletes the `u<ID>` address only if it still points to that tunnel, so an old job can no longer take away the address of the box's newer tunnel. When the hourly cleanup removes a box that has been offline for 4 days, it saves the held ID before deleting the tunnel, so a retry after a failed address step still keeps the ID for that box; if a retry finds the tunnel connected again, it leaves the box and drops that held ID. Boxes that never connected still get no held ID. *Why:* jobs can arrive out of order, so a late removal of an old tunnel deleted the new tunnel's address; and a retry after the tunnel was deleted couldn't tell the box had been offline, so a box from before box IDs lost its ID.
+
+Lines changed:
+- `worker.js` — 259 and 288 removing and cutting use `tunnelDns`; 267–272 add `tunnelDns` (the address only if it points to that tunnel); 674–685 `remove-box` saves the held ID before deleting the tunnel and drops it if the tunnel connected again
+
+################################end of entry################################
+
 ################################2026-11-25 sterling m security/queue-retries################################
 
 ## Asking again after "busy" gets the same answer; removals and cuts finish after a failure

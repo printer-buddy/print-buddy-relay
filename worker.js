@@ -256,12 +256,18 @@ async function removeTunnel(env, host, tunnelId) {
     try { await cf(env, "DELETE", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}`); } catch (e) { e.step = "delete"; throw e; }
   }
   try {
-    const rec = await dnsRecord(env, host);
+    const rec = await tunnelDns(env, host, tunnelId);
     if (rec) await cf(env, "DELETE", `/zones/${env.CF_ZONE_ID}/dns_records/${rec.id}`);
   } catch (e) {
     e.step = "dns";
     throw e;
   }
+}
+
+// the address only if it still points to this tunnel, so an old job can't take away a newer tunnel's address
+async function tunnelDns(env, host, tunnelId) {
+  const rec = await dnsRecord(env, host);
+  return rec && rec.content === `${tunnelId}.cfargotunnel.com` ? rec : null;
 }
 
 // never connected within an hour, or offline for 4 days
@@ -279,7 +285,7 @@ async function cutTunnel(env, host, tunnelId) {
     return true;
   } catch {
     await cf(env, "PUT", `/accounts/${env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}/configurations`, { config: { ingress: [{ service: "http_status:404" }] } });
-    const rec = await dnsRecord(env, host);
+    const rec = await tunnelDns(env, host, tunnelId);
     if (rec) await cf(env, "DELETE", `/zones/${env.CF_ZONE_ID}/dns_records/${rec.id}`);
     return false;
   }
@@ -666,19 +672,17 @@ const JOBS = {
   async "remove-box"(env, { id, tunnel_id: tunnelId, cf_id: cfId, host }) {
     const box = await sql(env, "SELECT key_hash, net, tunnel_id FROM boxes WHERE id = ?", id).first();
     if (!box || box.tunnel_id !== tunnelId) return [200, { ok: true, note: "changed since" }];
-    let offline = false;
     if (cfId) {
       const t = await getTunnel(env, cfId);
       if (t) {
         const s = stale(t, Date.now());
-        if (!s.neverConnected && !s.offline) return [200, { ok: true, note: "connected again" }];
-        offline = s.offline;
+        if (!s.neverConnected && !s.offline) return [200, { ok: true, note: "connected again" }, [sql(env, "DELETE FROM held WHERE id = ?", id)]];
+        // held is saved before the tunnel is deleted, so a retry after a failed DNS step still keeps the ID for the box
+        if (s.offline) await sql(env, "INSERT OR REPLACE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", id, box.key_hash, box.net, Date.now()).run();
       }
       await removeTunnel(env, host, cfId);
     }
-    const writes = [sql(env, "DELETE FROM boxes WHERE id = ?", id)];
-    if (offline) writes.push(sql(env, "INSERT OR REPLACE INTO held (id, key_hash, net, held) VALUES (?, ?, ?, ?)", id, box.key_hash, box.net, Date.now()));
-    return [200, { ok: true }, writes];
+    return [200, { ok: true }, [sql(env, "DELETE FROM boxes WHERE id = ?", id)]];
   },
 
   async "remove-tunnel"(env, { id, cf_id: cfId, host }) {
