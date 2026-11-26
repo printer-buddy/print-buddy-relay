@@ -192,6 +192,7 @@ async function markUsed(env, id) {
 }
 
 async function freeSlot(env, box) {
+  if (box.noslot) return;
   if (box.net) {
     const n = await netGet(env, box.net);
     n.n = Math.max(0, n.n - 1);
@@ -293,6 +294,13 @@ async function tunnelApi(request, env, ctx, url) {
         }
         return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
       }
+      if (box.noslot) {
+        const total = Number(await env.BOXES.get("count") || 0), boxNet = await netGet(env, box.net);
+        await env.BOXES.put(`net:${box.net}`, JSON.stringify({ n: boxNet.n + 1 }));
+        await env.BOXES.put("count", String(total + 1));
+        delete box.noslot;
+        await env.BOXES.put(kvKey, JSON.stringify(box));
+      }
       return json({ token: box.token, hostname: host });
     }
 
@@ -316,7 +324,7 @@ async function tunnelApi(request, env, ctx, url) {
         await removeTunnel(env, host, t.id);
         await env.BOXES.delete(kvKey);
       } catch {
-        await env.BOXES.put(kvKey, JSON.stringify({ ...rec, cut: true }));
+        await env.BOXES.put(kvKey, JSON.stringify({ ...rec, cut: true, noslot: true }));
         if (await cutTunnel(env, host, t.id).catch(() => false)) await env.BOXES.delete(kvKey);
       }
       return json({ error: "The app this box ID came from has been turned off by Printer Buddy." }, 403);
@@ -428,7 +436,7 @@ async function appApi(request, env, url) {
     return json({ ok: true, name, off: false });
   }
   await env.BOXES.put(`appoff:${name}`, "1");
-  let removed = 0, failed = 0;
+  let removed = 0, cut = 0, failed = 0;
   if (env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_ZONE_ID) {
     const domain = (env.SHARE_DOMAIN || url.hostname).replace(/^www\./, "");
     for (const kvKey of await listAll(env, "box:")) {
@@ -436,11 +444,16 @@ async function appApi(request, env, url) {
       if (!rec || rec.app !== name) continue;
       const box = await env.BOXES.get(kvKey, "json");
       if (!box) continue;
+      let deleted;
       try {
         await env.BOXES.put(kvKey, JSON.stringify({ ...box, cut: true }));
-        await cutTunnel(env, `u${id}.${domain}`, box.tunnel_id);
+        deleted = await cutTunnel(env, `u${id}.${domain}`, box.tunnel_id);
       } catch {
         failed++;
+        continue;
+      }
+      if (!deleted) {
+        cut++;
         continue;
       }
       await env.BOXES.delete(kvKey);
@@ -448,7 +461,7 @@ async function appApi(request, env, url) {
       removed++;
     }
   }
-  return json({ ok: true, name, off: true, tunnels_removed: removed, tunnels_failed: failed });
+  return json({ ok: true, name, off: true, tunnels_removed: removed, tunnels_cut: cut, tunnels_failed: failed });
 }
 
 async function listAll(env, prefix) {
